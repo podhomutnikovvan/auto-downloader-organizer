@@ -106,7 +106,9 @@ TRANSLATIONS = {
         "error_move": "Could not move {}: {}",
         "busy": "File is busy, will retry: {}",
         "in_list": "Still in the browser download list, waiting: {}",
+        "opened_move": "Opened from the browser, sorting now: {}",
         "hint": "Tip: closing the window minimizes it to the tray and keeps sorting.",
+        "grace_label": "Move after, sec",
         # Tray / startup options
         "opt_tray": "Minimize to system tray (keep running when window is closed)",
         "opt_autostart": "Start automatically with Windows",
@@ -150,7 +152,9 @@ TRANSLATIONS = {
         "error_move": "Не удалось переместить {}: {}",
         "busy": "Файл занят, повторю позже: {}",
         "in_list": "Файл ещё в списке загрузок браузера, жду: {}",
+        "opened_move": "Открыт из браузера, сортирую: {}",
         "hint": "Подсказка: закрытие окна сворачивает его в трей — сортировка продолжается.",
+        "grace_label": "Переносить через, сек",
         # Tray / startup options
         "opt_tray": "Сворачивать в трей (работать при закрытом окне)",
         "opt_autostart": "Запускать автоматически вместе с Windows",
@@ -194,7 +198,9 @@ TRANSLATIONS = {
         "error_move": "无法移动 {}：{}",
         "busy": "文件被占用，稍后重试：{}",
         "in_list": "文件仍在浏览器下载列表中，等待：{}",
+        "opened_move": "已从浏览器打开，立即整理：{}",
         "hint": "提示：关闭窗口会最小化到托盘，整理继续进行。",
+        "grace_label": "延迟移动（秒）",
         # Tray / startup options
         "opt_tray": "最小化到系统托盘（关闭窗口后继续运行）",
         "opt_autostart": "随 Windows 自动启动",
@@ -584,7 +590,7 @@ class AppLogic:
             # How long we wait for the browser to finish with a file before
             # moving it anyway (seconds). Prevents breaking "Show in folder"
             # links in the browser's own downloads list.
-            "grace_seconds": 60,
+            "grace_seconds": 300,
             # Tray mode: minimize-to-tray is ON by default; autostart is OFF
             # until the user ticks the checkbox (it writes to the registry).
             "minimize_to_tray": True,
@@ -696,25 +702,147 @@ class AppLogic:
                 continue  # locked / not readable - just skip this profile
         return False
 
+    def _file_opened_in_browser(self, name: str) -> bool:
+        """True if the user already opened this download from the browser UI.
+
+        Detection is heuristic but cheap and read-only:
+        * Chromium-based browsers write a small "open" annotation into their
+          History database (downloads file counts / last access). We simply
+          check whether the file's atime changed after it was written to disk
+          (mtime): opening a file from Explorer or the browser updates atime.
+        * Additionally we look for a matching entry in the browser history DB
+          marked as finished (state = 1) whose record was touched recently -
+          that usually means the user clicked "Open file".
+        Any error => False (fail-open: normal grace-period behaviour applies).
+        """
+        try:
+            # Fast path: file accessed after being fully written.
+            st = None
+            for cand in Path(self.config["watch_dir"]).glob(name):
+                st = cand.stat()
+                break
+            if st is not None and st.st_atime > st.st_mtime + 1:
+                return True
+        except Exception:
+            pass
+        # Slow path: completed-but-recently-touched entries in Chrome history.
+        deadline = time.time() + 0.5
+        local = os.environ.get("LOCALAPPDATA", "")
+        if not local:
+            return False
+        try:
+            import sqlite3
+            hist = Path(local) / "Google" / "Chrome" / "User Data"
+            if not hist.is_dir():
+                return False
+            like = "%" + name.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
+            for prof in sorted(hist.iterdir()):
+                db = prof / "History"
+                if not db.is_file() or time.time() > deadline:
+                    continue
+                try:
+                    uri = f"file:{db.as_posix()}?mode=ro&immutable=1"
+                    con = sqlite3.connect(uri, timeout=0.2, uri=True)
+                    try:
+                        cur = con.cursor()
+                        # last_access_time updated when the user opens the file
+                        # from the downloads page; stored as microseconds since
+                        # 1601-01-01 (Chrome epoch). We only need existence of
+                        # a finished row whose record was modified very recently.
+                        cur.execute(
+                            "SELECT COUNT(*) FROM downloads "
+                            "WHERE current_path LIKE ? AND state = 1", (like,))
+                        if cur.fetchone()[0] > 0:
+                            # The DB file itself changes on open-clicks; use its
+                            # mtime as a proxy for "something just happened".
+                            if time.time() - db.stat().st_mtime < 10:
+                                return True
+                    except sqlite3.Error:
+                        pass
+                    finally:
+                        con.close()
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
     # ------------------------------ file moving ---------------------------- #
+    def _file_is_free(self, path: Path) -> bool:
+        """True when no other process (browser/antivirus) holds the file open.
+
+        On Windows an exclusive open() fails with a sharing violation while
+        the browser still keeps the just-downloaded file locked; on Linux/macOS
+        files are not locked this way, so we always report 'free'.
+        """
+        if os.name != "nt":
+            return True
+        try:
+            import msvcrt
+            fh = os.open(str(path), os.O_RDWR | os.O_BINARY)
+            try:
+                # Try to lock the first byte exclusively for 0 attempts.
+                msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False          # someone else holds the lock
+            try:
+                msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            return True
+        except OSError:
+            return False              # cannot even open it -> treat as busy
+        except Exception:
+            return True               # unexpected error -> don't block sorting
+
     def move_file(self, src_path: Path):
         src = Path(src_path)
         if not src.exists() or not src.is_file():
             return
-        # Do not steal a file the browser still lists as an active download:
-        # its "Show in folder" button would then fail with "file moved".
-        # Re-check it soon; after GRACE_SECONDS we sort anyway so the queue
-        # can never be blocked forever by stale browser entries.
         try:
             age = time.time() - src.stat().st_mtime
         except OSError:
             age = 0.0
-        grace = float(self.config.get("grace_seconds", 60))
-        if age < grace and self._file_in_browser_list(src.name):
-            self.log(self.tr("in_list", src.name), "warn")
+        grace = float(self.config.get("grace_seconds", 300))
+        retry_in = float(self.config.get("settle_seconds", 3)) + 2
+
+        # Rule 1: never touch a file that is still being written / locked by
+        # the browser. Retry shortly.
+        if not self._file_is_free(src):
+            self.log(self.tr("busy", src.name), "warn")
             if self._handler is not None:
-                self._handler.pending[src] = time.time() - self.config["settle_seconds"] + 2
+                self._handler.pending[src] = time.time() - retry_in
             return
+
+        # Rule 2 (user request): keep the file in Downloads until either
+        #   a) the user has opened it from the browser's download list
+        #      (detected via the browser history DBs), or
+        #   b) `grace` seconds have passed since the download finished.
+        # This way the browser's "Show in folder" link never breaks.
+        if age < grace:
+            opened = self._file_opened_in_browser(src.name)
+            listed = self._file_in_browser_list(src.name)
+            if opened:
+                self.log(self.tr("opened_move", src.name), "info")
+            elif listed:
+                # Still present in the browser downloads list and not opened
+                # yet -> wait; re-check after a short pause.
+                self.log(self.tr("in_list", src.name), "warn")
+                if self._handler is not None:
+                    self._handler.pending[src] = time.time() - retry_in
+                return
+            else:
+                # Not in any active list: schedule one more check near the
+                # deadline so freshly downloaded files get a fair chance to be
+                # opened before they are moved.
+                if self._handler is not None:
+                    self._handler.pending[src] = time.time() - retry_in
+                    # Do not queue forever: fall through to moving once the
+                    # grace period elapses (handled by the next iteration).
+                    remaining = grace - age
+                    if remaining > retry_in:
+                        self._handler.pending[src] = time.time() - (retry_in - min(remaining, 5))
+                        return
         folder = self.category_for(src.name)
         dst_dir = Path(self.config["dest_dir"]) / folder
         dst_dir.mkdir(parents=True, exist_ok=True)
@@ -934,6 +1062,16 @@ class GUI:
             0, "watch_label", logic.config["watch_dir"], self.browse_watch)
         self.lbl_dest, self.entry_dest = add_path_row(
             1, "dest_label", logic.config["dest_dir"], self.browse_dest)
+
+        # Third row: delay before moving a finished download (seconds).
+        self.lbl_grace = tk.Label(cin, text="", font=(FONT, 10), bg=CARD, fg=FG,
+                                  anchor="w", width=16)
+        self.lbl_grace.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.entry_grace = tk.Entry(cin, font=(FONT, 10), bg=FIELD, fg=FG,
+                                    insertbackground=FG, relief="flat", width=8,
+                                    disabledbackground="#141821", disabledforeground=MUTED)
+        self.entry_grace.grid(row=3, column=1, sticky="w", padx=8, pady=(10, 0), ipady=6)
+        self.entry_grace.insert(0, str(logic.config.get("grace_seconds", 300)))
         cin.columnconfigure(1, weight=1)
 
         # ================= big start/stop button ================= #
@@ -1060,6 +1198,7 @@ class GUI:
         self.lbl_section.config(text=tr("section_folders"))
         self.lbl_watch.config(text=tr("watch_label"))
         self.lbl_dest.config(text=tr("dest_label"))
+        self.lbl_grace.config(text=tr("grace_label"))
         self.lbl_log.config(text=tr("log_header"))
         self.lbl_hint.config(text=tr("hint"))
         self.cb_tray.config(text=tr("opt_tray"))
@@ -1128,15 +1267,28 @@ class GUI:
                 return
             self.entry_watch.config(state="disabled")
             self.entry_dest.config(state="disabled")
+            # The delay stays editable while running: save_dirs() pushes it
+            # to config on Stop, and move_file() reads it live each time.
         else:
+            # Stop first, then save (save_dirs rewrites the grace field).
             self.logic.stop_watch()
+            self.save_dirs()
             self.entry_watch.config(state="normal")
             self.entry_dest.config(state="normal")
 
     def save_dirs(self):
-        """Persist the two folder paths into config.json."""
+        """Persist the two folder paths and the delay into config.json."""
         self.logic.config["watch_dir"] = self.entry_watch.get().strip()
         self.logic.config["dest_dir"] = self.entry_dest.get().strip()
+        # Delay before moving: accept any number, clamp to 10..3600 seconds.
+        try:
+            grace = float(self.entry_grace.get().strip())
+        except ValueError:
+            grace = 300.0
+        grace = min(max(grace, 10.0), 3600.0)
+        self.logic.config["grace_seconds"] = int(grace)
+        self.entry_grace.delete(0, tk.END)
+        self.entry_grace.insert(0, str(int(grace)))
         self.logic.save_config()
 
     def on_destroy(self, event=None):
