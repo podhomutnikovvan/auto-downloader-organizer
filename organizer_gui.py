@@ -702,6 +702,8 @@ class GUI:
 
         # --- window close behaviour & tray icon ----------------------------- #
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # Bind to the real widget destruction so paths are always flushed.
+        root.bind("<Destroy>", self.on_destroy, add="+")
         self.refresh_texts()
 
         if start_hidden or logic.config.get("start_hidden", False):
@@ -798,12 +800,15 @@ class GUI:
         if path:
             self.entry_watch.delete(0, tk.END)
             self.entry_watch.insert(0, path)
+            # Save immediately so the choice survives closing the app.
+            self.save_dirs()
 
     def browse_dest(self):
         path = filedialog.askdirectory(initialdir=self.entry_dest.get() or str(Path.home()))
         if path:
             self.entry_dest.delete(0, tk.END)
             self.entry_dest.insert(0, path)
+            self.save_dirs()
 
     def append_log(self, message: str, kind: str = "info"):
         """Thread-safe log line insertion (worker threads call this)."""
@@ -836,6 +841,14 @@ class GUI:
         self.logic.config["watch_dir"] = self.entry_watch.get().strip()
         self.logic.config["dest_dir"] = self.entry_dest.get().strip()
         self.logic.save_config()
+
+    def on_destroy(self, event=None):
+        """Last safety net: whenever the window is destroyed (Exit from tray,
+        task-manager kill of Tk loop, etc.) write the current paths to disk."""
+        try:
+            self.save_dirs()
+        except Exception:
+            pass
 
     # --------------------------- option handlers --------------------------- #
     def on_tray_option(self):
