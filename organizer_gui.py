@@ -887,9 +887,19 @@ class AppLogic:
             # version we handled. A genuine re-download of the same name has a
             # different fingerprint and is allowed through; stale events for
             # the identical bytes are not.
+            # A file that was already fully handled (moved away AND original
+            # gone) must never be scheduled again. The one exception is the
+            # copy+delete mode: there _moved_done[key] == fp means "the copy
+            # exists at the destination, but deleting the locked original is
+            # still pending" - such retries are legitimate and expected.
             done = self._moved_done.get(key)
             if done is not None and done != (-1.0, -1):
-                return
+                try:
+                    cur_fp = self._fingerprint(src)
+                except Exception:
+                    cur_fp = None
+                if done != cur_fp:
+                    return
             if key not in self._awaiting:
                 return
             tries = self._retries.get(key, 0)
@@ -1006,8 +1016,43 @@ class AppLogic:
         dst_dir = Path(self.config["dest_dir"]) / folder
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = self.unique_path(dst_dir / src.name)
+        # User request: the file must end up ONLY in the organized folder.
+        # If dest_dir is a subfolder of watch_dir (the default setup, e.g.
+        # Downloads\Sorted), shutil.move() would rename the whole Sorted
+        # directory into itself -> endless photo.jpg / photo (1).jpg ...
+        # duplication. So we copy first and delete the original afterwards;
+        # on the same drive this is just as fast as a move.
+        same_drive = False
         try:
-            shutil.move(str(src), str(dst))
+            same_drive = os.path.exists(dst_dir) and \
+                src.resolve().drive == dst.resolve().drive
+        except Exception:
+            pass
+        try:
+            if same_drive:
+                # Anti-double-copy: if a previous pass already copied this
+                # exact version (fingerprint recorded in _moved_done with the
+                # special "copied, original still pending deletion" marker)
+                # or the bytes are already present at dst, skip straight to
+                # deleting the original instead of creating 'file (1).jpg'.
+                prev = None
+                with self._moving_lock:
+                    prev = self._moved_done.get(key)
+                already_copied = prev is not None and prev == fp
+                if not already_copied:
+                    shutil.copy2(str(src), str(dst))  # keep timestamps/metadata
+                try:
+                    src.unlink()                   # remove from Downloads now
+                except PermissionError:
+                    # Still locked (browser preview open): remember that the
+                    # copy exists, then retry deletion shortly. The fingerprint
+                    # marker below makes the retry delete-only, never re-copy.
+                    with self._moving_lock:
+                        self._moved_done[key] = fp
+                    self._schedule_retry(src, 5.0)
+                    return
+            else:
+                shutil.move(str(src), str(dst))    # across drives: plain move
         except FileNotFoundError:
             # The file vanished (user deleted/moved it) - nothing to do and,
             # crucially, NO duplicate was created.
@@ -1026,8 +1071,13 @@ class AppLogic:
         # Success: clear retry counters and log the move. _mark_done() also
         # records this path as "handled for good" so no later event can make
         # us create photo (1).jpg / photo (2).jpg ... duplicates again.
-        self._finish_awaiting(src)         # done with this file for good
-        self._mark_done(src, fp)
+        # NOTE: in copy+delete mode with a locked original we scheduled a
+        # deletion-retry above; in that case keep tracking the source until
+        # it is really gone (the next pass hits FileNotFoundError and marks
+        # the file done automatically).
+        if not (same_drive and src.exists()):
+            self._finish_awaiting(src)     # done with this file for good
+            self._mark_done(src, fp)
         self.log(self.tr("moving", src.name, folder, dst.name), "move")
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
