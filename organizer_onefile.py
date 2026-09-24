@@ -22,6 +22,7 @@ Downloader Organizer (однофайловая версия) — авто-орг
 
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -183,8 +184,9 @@ def main():
     watch = Path(cfg["watch_dir"])
 
     if "--dry-run" in sys.argv:                   # проверка правил без перемещения
+        sep = "\\" if os.name == "nt" else "/"     # разделитель под вашу ОС
         for name in sys.argv[sys.argv.index("--dry-run") + 1:]:
-            print(f"{name:30s} → {cfg['dest_dir']}\\{classify(name, cfg)}")
+            print(f"{name:30s} → {cfg['dest_dir']}{sep}{classify(name, cfg)}")
         return
     if "--undo" in sys.argv:
         undo_last()
