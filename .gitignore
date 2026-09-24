@@ -4,3 +4,5 @@ dist/
 build/
 *.log
 node_modules/
+history.log
+__pycache__/
