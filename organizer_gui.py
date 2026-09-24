@@ -105,6 +105,7 @@ TRANSLATIONS = {
         "skipped": "Skipped (still downloading): {}",
         "error_move": "Could not move {}: {}",
         "busy": "File is busy, will retry: {}",
+        "give_up": "Giving up on {} after too many retries; leaving it in place",
         "in_list": "Still in the browser download list, waiting: {}",
         "opened_move": "Opened from the browser, sorting now: {}",
         "hint": "Tip: closing the window minimizes it to the tray and keeps sorting.",
@@ -151,6 +152,7 @@ TRANSLATIONS = {
         "skipped": "Пропуск (ещё качается): {}",
         "error_move": "Не удалось переместить {}: {}",
         "busy": "Файл занят, повторю позже: {}",
+        "give_up": "Слишком много попыток для {}; оставляю файл на месте",
         "in_list": "Файл ещё в списке загрузок браузера, жду: {}",
         "opened_move": "Открыт из браузера, сортирую: {}",
         "hint": "Подсказка: закрытие окна сворачивает его в трей — сортировка продолжается.",
@@ -197,6 +199,7 @@ TRANSLATIONS = {
         "skipped": "跳过（仍在下载）：{}",
         "error_move": "无法移动 {}：{}",
         "busy": "文件被占用，稍后重试：{}",
+        "give_up": "{}重试次数过多，保留原位",
         "in_list": "文件仍在浏览器下载列表中，等待：{}",
         "opened_move": "已从浏览器打开，立即整理：{}",
         "hint": "提示：关闭窗口会最小化到托盘，整理继续进行。",
@@ -568,6 +571,12 @@ class AppLogic:
         self.observer = None
         self.running = False
         self._handler = None  # set by start_watch(); used for retry scheduling
+        # Anti-duplication bookkeeping (see _schedule_retry / move_file):
+        # per-file retry counters and a guard against concurrent processing.
+        self._retries: dict[Path, int] = {}
+        self._max_retries = 200          # hard cap -> no infinite loops ever
+        self._moving: set[str] = set()   # paths currently being moved
+        self._moving_lock = threading.Lock()
         # Callbacks are wired up by the GUI / tray layer.
         self.gui_callback = lambda msg, kind="info": None  # log line -> window
         self.state_callback = lambda: None                 # running-state changed
@@ -795,10 +804,47 @@ class AppLogic:
         except Exception:
             return True               # unexpected error -> don't block sorting
 
+    def _schedule_retry(self, src: Path, delay: float):
+        """Put a file back into the pending queue so sweep_loop retries it.
+
+        IMPORTANT: we only reschedule when the file STILL EXISTS in the watch
+        folder. The previous version rescheduled unconditionally, which caused
+        an infinite duplicate loop: every failed move left the source file in
+        place while unique_path() happily created 'photo (1).jpg', then
+        'photo (2).jpg' ... forever. Now a failure logs ONE warning and the
+        file is retried at most `_max_retries` times before being skipped.
+        """
+        if self._handler is None or not src.exists():
+            return
+        tries = self._retries.get(src, 0)
+        if tries >= self._max_retries:
+            self.log(self.tr("give_up", src.name), "warn")
+            self._retries.pop(src, None)
+            return
+        self._retries[src] = tries + 1
+        # last_activity is set so that (now - last) == settle_seconds - delay,
+        # i.e. sweep_loop will pick it up again after `delay` seconds.
+        settle = float(self.config["settle_seconds"])
+        self._handler.pending[src] = time.time() - max(0.0, settle - delay)
+
     def move_file(self, src_path: Path):
         src = Path(src_path)
         if not src.exists() or not src.is_file():
             return
+        # Hard guard against double-processing the same file concurrently
+        # (event thread + sweeper can both call us for one path).
+        key = str(src.resolve()) if src.exists() else str(src)
+        with self._moving_lock:
+            if key in self._moving:
+                return
+            self._moving.add(key)
+        try:
+            self._move_file_inner(src)
+        finally:
+            with self._moving_lock:
+                self._moving.discard(key)
+
+    def _move_file_inner(self, src: Path):
         try:
             age = time.time() - src.stat().st_mtime
         except OSError:
@@ -807,11 +853,10 @@ class AppLogic:
         retry_in = float(self.config.get("settle_seconds", 3)) + 2
 
         # Rule 1: never touch a file that is still being written / locked by
-        # the browser. Retry shortly.
+        # the browser. Retry shortly (bounded number of times).
         if not self._file_is_free(src):
             self.log(self.tr("busy", src.name), "warn")
-            if self._handler is not None:
-                self._handler.pending[src] = time.time() - retry_in
+            self._schedule_retry(src, retry_in)
             return
 
         # Rule 2 (user request): keep the file in Downloads until either
@@ -821,44 +866,38 @@ class AppLogic:
         # This way the browser's "Show in folder" link never breaks.
         if age < grace:
             opened = self._file_opened_in_browser(src.name)
-            listed = self._file_in_browser_list(src.name)
             if opened:
                 self.log(self.tr("opened_move", src.name), "info")
-            elif listed:
-                # Still present in the browser downloads list and not opened
-                # yet -> wait; re-check after a short pause.
-                self.log(self.tr("in_list", src.name), "warn")
-                if self._handler is not None:
-                    self._handler.pending[src] = time.time() - retry_in
-                return
             else:
-                # Not in any active list: schedule one more check near the
-                # deadline so freshly downloaded files get a fair chance to be
-                # opened before they are moved.
-                if self._handler is not None:
-                    self._handler.pending[src] = time.time() - retry_in
-                    # Do not queue forever: fall through to moving once the
-                    # grace period elapses (handled by the next iteration).
-                    remaining = grace - age
-                    if remaining > retry_in:
-                        self._handler.pending[src] = time.time() - (retry_in - min(remaining, 5))
-                        return
+                # Wait until the grace period expires; re-check every few
+                # seconds so an "open" click moves the file promptly.
+                remaining = grace - age
+                self._schedule_retry(src, min(max(remaining, 2.0), 5.0))
+                return
         folder = self.category_for(src.name)
         dst_dir = Path(self.config["dest_dir"]) / folder
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = self.unique_path(dst_dir / src.name)
         try:
             shutil.move(str(src), str(dst))
-            self.log(self.tr("moving", src.name, folder, dst.name), "move")
-            with LOG_FILE.open("a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
+        except FileNotFoundError:
+            # The file vanished (user deleted/moved it) - nothing to do and,
+            # crucially, NO duplicate was created.
+            self._retries.pop(src, None)
+            return
         except PermissionError:
-            # File is locked (browser/antivirus) - retry a bit later.
             self.log(self.tr("busy", src.name), "warn")
-            if self._handler is not None:
-                self._handler.pending[src] = time.time() - self.config["settle_seconds"] + 1
+            self._schedule_retry(src, retry_in)
+            return
         except Exception as e:
             self.log(self.tr("error_move", src.name, e), "error")
+            self._retries.pop(src, None)   # do not spam retries on real errors
+            return
+        # Success: clear retry counters and log the move.
+        self._retries.pop(src, None)
+        self.log(self.tr("moving", src.name, folder, dst.name), "move")
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
 
     # ------------------------------- watching ------------------------------ #
     def start_watch(self):
