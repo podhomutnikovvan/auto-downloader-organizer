@@ -1,8 +1,5 @@
-# Python bytecode cache
-__pycache__/
-*.pycnode_modules/
+*.lognode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/
