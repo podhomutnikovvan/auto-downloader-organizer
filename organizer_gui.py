@@ -615,7 +615,7 @@ class GUI:
         lbl_sec.grid(row=0, column=0, columnspan=3, sticky="w")
         self.lbl_section = lbl_sec
 
-        def add_path_row(row, label_key, initial):
+        def add_path_row(row, label_key, initial, command):
             lbl = tk.Label(cin, text="", font=(FONT, 10), bg=CARD, fg=FG,
                            anchor="w", width=16)
             lbl.grid(row=row + 1, column=0, sticky="w", pady=(10, 0))
@@ -627,14 +627,16 @@ class GUI:
             btn = tk.Button(cin, text="\u22ef", width=3, bd=0, relief="flat",
                             bg=BORDER, fg=FG, activebackground=ACCENT,
                             activeforeground="#ffffff", cursor="hand2",
-                            font=(FONT, 10, "bold"))
+                            font=(FONT, 10, "bold"), command=command)
             btn.grid(row=row + 1, column=2, pady=(10, 0))
+            # Hover effect for the browse button (same helper as other buttons).
+            self._style_button(btn, BORDER, FG)
             return lbl, ent
 
-        self.lbl_watch, self.entry_watch = add_path_row(0, "watch_label",
-                                                        logic.config["watch_dir"])
-        self.lbl_dest, self.entry_dest = add_path_row(1, "dest_label",
-                                                      logic.config["dest_dir"])
+        self.lbl_watch, self.entry_watch = add_path_row(
+            0, "watch_label", logic.config["watch_dir"], self.browse_watch)
+        self.lbl_dest, self.entry_dest = add_path_row(
+            1, "dest_label", logic.config["dest_dir"], self.browse_dest)
         cin.columnconfigure(1, weight=1)
 
         # ================= big start/stop button ================= #
