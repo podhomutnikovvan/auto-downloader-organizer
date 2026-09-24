@@ -1,58 +1,114 @@
-# Downloader Organizer
+# 📥 Auto Downloader Organizer
 
-Авто-организатор папки «Загрузки»: браузер качает файлы как обычно, а программа
-сама раскладывает докачанные файлы по подпапкам (Документы, Картинки, Архивы...).
+**EN** · [RU](#русский)
 
-## 1. Установка (нужен Python 3.10+)
+A small Windows-friendly app that keeps your **Downloads folder clean automatically**.
+Your browser keeps downloading to `Downloads` as usual — the app watches the folder,
+waits until a file is fully downloaded (handles `.part` / `.crdownload` temp files),
+and moves it into a category subfolder: Documents, Spreadsheets, Presentations,
+Images, Music, Video, Archives, Installers, Code, Fonts, 3D, E-books, Other.
+
+## ✨ Features
+
+- 🖥️ Modern dark GUI (Tkinter) — pick folders with buttons, no config editing
+- 🌍 Multilingual interface: English / Русский / 中文 (switched instantly, saved in config)
+- 🗂️ 90+ file extensions mapped to categories; folder names are localized too
+- 🕒 Waits for downloads to finish before moving (never breaks an active download)
+- 🔁 Safe renaming on name collisions (`file (1).pdf`, `file (2).zip`, ...)
+- 🧩 System tray mode: keep sorting with the window closed
+- 🚀 Windows autostart (registry `HKCU\...\Run`, no admin rights required)
+- 📝 Undo journal — every move is logged to `history.log`
+
+## 🚀 Quick start
+
+### Run from source (Python 3.10+)
+
 ```bash
-python3 -m pip install -r requirements.txt      # или: pip install watchdog
+pip install -r requirements.txt
+python organizer_gui.py
 ```
 
-## 2. Настройка
-При первом запуске рядом со скриптом создаётся `config.json`:
-```json
-{
-  "downloads_dir": "~/Downloads",
-  "settle_seconds": 3,
-  "partial_extensions": [".part", ".crdownload", ".download", ".tmp"],
-  "rules": { ".pdf": "Документы", ".jpg": "Картинки", ".zip": "Архивы" },
-  "fallback_folder": "Прочее"
-}
-```
-Путь на Windows можно задать прямо в конфиге: `"downloads_dir": "C:/Users/Вася/Downloads"`.
+### Run as a standalone .exe (no Python needed)
 
-## 3. Запуск
-```bash
-python3 downloader_organizer.py            # режим слежения (остановка Ctrl+C)
-python3 downloader_organizer.py --dry-run report.pdf photo.png   # показать, куда попадёт файл
-python3 downloader_organizer.py --undo     # вернуть последний перемещённый файл обратно
-```
+Download the latest `organizer.exe` from the
+[Releases](../../releases) page, put it anywhere (e.g. `C:\Tools\Organizer\`)
+and double-click. On first launch choose your folders and press **START**.
 
-### Фоновый запуск
-Linux/macOS: `nohup python3 downloader_organizer.py > organizer.log 2>&1 &`
-Windows (без чёрного окна): `pythonw downloader_organizer.py`
+### Build the .exe yourself
 
-### Автозапуск при входе в систему
-- **Windows:** `Win+R` → `shell:startup` → создать ярлык командой:
-  `schtasks /create /tn "DownloaderOrganizer" /tr "pythonw C:\path\downloader_organizer.py" /sc onlogon`
-- **Linux:** `~/.config/autostart/downloader-organizer.desktop` с `Exec=python3 /path/downloader_organizer.py`
-- **macOS:** `launchctl load ~/Library/LaunchAgents/com.user.downloader.plist`
-
-## 4. Как это работает
-1. `watchdog` слушает события файловой системы (не грузит CPU опросами).
-2. Файлы с `.part`/`.crdownload` игнорируются — они ещё качаются.
-3. Файл переносится, когда браузер переименовал его из `*.part` в нормальное имя
-   **или** когда его размер не меняется дольше `settle_seconds`.
-4. Конфликты имён решаются как в браузере: `report (1).pdf`, `report (2).pdf`.
-5. Каждое перемещение пишется в `history.log` — отсюда работает `--undo`.
-
-## 5. Сборка в .exe (по желанию)
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --noconsole downloader_organizer.py   # dist/downloader_organizer.exe
+python -m PyInstaller --onefile --noconsole organizer_gui.py
+# result: dist/organizer.exe
 ```
 
-## Ограничения текущей версии
-- Нет иконки в системном трее (только консоль/лог) — добавляется библиотекой `pystray`.
-- Не следит за вложенными подпапками (`recursive=False`).
-- Классификация только по расширению; сортировка фото по EXIF-дате — в планах.
+## ⚙️ Configuration
+
+The app creates `config.json` next to the script / executable:
+
+```json
+{
+    "language": "ru",
+    "watch_dir": "C:\\Users\\you\\Downloads",
+    "dest_dir": "D:\\Downloads",
+    "settle_seconds": 3,
+    "minimize_to_tray": true,
+    "start_hidden": false,
+    "autostart": false
+}
+```
+
+Most options are available right in the GUI. `settle_seconds` controls how long
+the file size must stay unchanged before the app considers the download finished.
+
+## 🛠️ How it works
+
+1. `watchdog` listens to filesystem events in the watched folder (near-zero CPU).
+2. Browser temp files (`.part`, `.crdownload`, `.download`, `.tmp`) are ignored.
+3. A file is moved when either:
+   - the browser renames `file.pdf.part → file.pdf` (Chrome/Firefox behaviour), or
+   - its size stops changing for `settle_seconds` seconds.
+4. The destination subfolder is chosen by extension; each move is appended to `history.log`.
+
+## 📄 License
+
+[MIT](LICENSE) — free to use, modify and distribute.
+
+---
+
+# Русский
+
+Небольшое приложение для Windows, которое автоматически наводит порядок в папке
+**«Загрузки»**. Браузер качает файлы как обычно, а программа ждёт окончания
+загрузки и раскладывает их по подпапкам: Документы, Таблицы, Презентации,
+Картинки, Музыка, Видео, Архивы, Установщики, Код, Шрифты, 3D, Книги, Прочее.
+
+## Возможности
+
+- Современный тёмный интерфейс — папки выбираются кнопками, лезть в код не нужно
+- Язык интерфейса на выбор: English / Русский / 中文 (переключается мгновенно)
+- 90+ расширений файлов, имена папок-категорий тоже переводятся
+- Файл перемещается только после полной докачки (временные файлы браузера игнорируются)
+- Защита от перезаписи: при конфликте имён добавляется `(1)`, `(2)`...
+- Режим трея: сортировка продолжается при закрытом окне
+- Автозапуск с Windows через реестр (права администратора не требуются)
+- Журнал всех перемещений в `history.log`
+
+## Установка и запуск
+
+```bash
+pip install -r requirements.txt
+python organizer_gui.py
+```
+
+Сборка exe-файла:
+
+```bash
+pip install pyinstaller
+python -m PyInstaller --onefile --noconsole organizer_gui.py
+# готовый файл: dist/organizer.exe
+```
+
+## Лицензия
+
+MIT — свободное использование и модификация.

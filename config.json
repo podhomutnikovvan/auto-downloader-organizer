@@ -1,9 +1,0 @@
-{
-    "language": "ru",
-    "watch_dir": "C:\\Users\\user\\Downloads",
-    "dest_dir": "D:\\Downloads",
-    "settle_seconds": 3,
-    "minimize_to_tray": true,
-    "start_hidden": false,
-    "autostart": false
-}
