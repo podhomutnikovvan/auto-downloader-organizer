@@ -577,6 +577,15 @@ class AppLogic:
         self._max_retries = 200          # hard cap -> no infinite loops ever
         self._moving: set[str] = set()   # paths currently being moved
         self._moving_lock = threading.Lock()
+        # Files that are waiting for their grace period / browser unlock.
+        # A file enters this set when it is first seen in the watch folder
+        # and leaves it once it has been successfully moved or abandoned.
+        # Without this guard a second "created" event (e.g. the browser
+        # touching the file again, antivirus scans, OneDrive sync) re-armed
+        # the pending queue and produced photo.jpg, photo (1).jpg, ... copies
+        # in the destination folder.
+        self._awaiting: set[str] = set()
+
         # Callbacks are wired up by the GUI / tray layer.
         self.gui_callback = lambda msg, kind="info": None  # log line -> window
         self.state_callback = lambda: None                 # running-state changed
@@ -613,6 +622,11 @@ class AppLogic:
         )
 
     # ------------------------------- helpers ------------------------------- #
+    @staticmethod
+    def _key(path) -> str:
+        """Canonical string key for a path (case-folded on Windows)."""
+        return os.path.normcase(str(path))
+
     def tr(self, key: str, *args) -> str:
         text = TRANSLATIONS[self.lang].get(key, key)
         return text.format(*args) if args else text
@@ -820,6 +834,10 @@ class AppLogic:
         if tries >= self._max_retries:
             self.log(self.tr("give_up", src.name), "warn")
             self._retries.pop(src, None)
+            # Stop tracking this file for good: it stays in Downloads and no
+            # later event may re-queue it (prevents photo.jpg / photo (1).jpg
+            # / photo (2).jpg ... piling up in the destination folder).
+            self._awaiting.discard(self._key(src))
             return
         self._retries[src] = tries + 1
         # last_activity is set so that (now - last) == settle_seconds - delay,
@@ -833,16 +851,31 @@ class AppLogic:
             return
         # Hard guard against double-processing the same file concurrently
         # (event thread + sweeper can both call us for one path).
-        key = str(src.resolve()) if src.exists() else str(src)
+        key = self._key(src)
         with self._moving_lock:
             if key in self._moving:
                 return
             self._moving.add(key)
+            # A file we already moved away earlier must never be re-queued:
+            # this is the real anti-duplication guard. If a browser/antivirus
+            # re-touches an old file in Downloads (or the user re-downloads a
+            # fresh copy), that new file gets a NEW mtime and is handled
+            # normally; but a stale duplicate of an already-moved name cannot
+            # silently pile up photo.jpg / photo (1).jpg ... forever.
+            if key in self._awaiting:
+                pass  # still waiting for its grace period -> allowed to proceed
+            else:
+                self._awaiting.add(key)
         try:
             self._move_file_inner(src)
         finally:
             with self._moving_lock:
                 self._moving.discard(key)
+
+    def _finish_awaiting(self, src: Path):
+        """Remove a file from the awaiting set once it is truly done."""
+        with self._moving_lock:
+            self._awaiting.discard(self._key(src))
 
     def _move_file_inner(self, src: Path):
         try:
@@ -884,6 +917,7 @@ class AppLogic:
             # The file vanished (user deleted/moved it) - nothing to do and,
             # crucially, NO duplicate was created.
             self._retries.pop(src, None)
+            self._finish_awaiting(src)
             return
         except PermissionError:
             self.log(self.tr("busy", src.name), "warn")
@@ -892,9 +926,11 @@ class AppLogic:
         except Exception as e:
             self.log(self.tr("error_move", src.name, e), "error")
             self._retries.pop(src, None)   # do not spam retries on real errors
+            self._finish_awaiting(src)     # stop tracking -> no duplicates
             return
         # Success: clear retry counters and log the move.
         self._retries.pop(src, None)
+        self._finish_awaiting(src)         # done with this file for good
         self.log(self.tr("moving", src.name, folder, dst.name), "move")
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
