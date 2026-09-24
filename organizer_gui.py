@@ -1027,14 +1027,108 @@ class GUI:
         self.root.destroy()
 
 
+class ShowMeListener:
+    """Receive the WM_SHOWME broadcast from a duplicate launch and show the window.
+
+    Tkinter cannot see arbitrary Win32 messages, so we create a tiny hidden
+    message-only window with ctypes and poll it from the Tk event loop once
+    every ~200 ms (non-blocking PeekMessageW). This keeps Explorer untouched
+    and costs essentially zero CPU.
+    """
+
+    def __init__(self, on_show):
+        self.on_show = on_show
+        self.hwnd = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+
+            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND,
+                                         wintypes.UINT, wintypes.WPARAM,
+                                         wintypes.LPARAM)
+
+            def _wnd_proc(hwnd, msg, wparam, lparam):
+                if msg == WM_SHOWME:
+                    # Hop back onto the Tk thread; never call Tk from here.
+                    on_show()
+                    return 0
+                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            self._proc_keepalive = WNDPROC(_wnd_proc)
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [("style", wintypes.UINT),
+                            ("lpfnWndProc", WNDPROC),
+                            ("cbClsExtra", ctypes.c_int),
+                            ("cbWndExtra", ctypes.c_int),
+                            ("hInstance", wintypes.HINSTANCE),
+                            ("hIcon", wintypes.HICON),
+                            ("hCursor", wintypes.HANDLE),
+                            ("hbrBackground", wintypes.HBRUSH),
+                            ("lpszMenuName", wintypes.LPCWSTR),
+                            ("lpszClassName", wintypes.LPCWSTR),
+                            ("hWndBringsToTopOnActivate", wintypes.HWND)]
+
+            HWND_MESSAGE = -3  # parent value => message-only window
+            wc = WNDCLASSW()
+            wc.lpfnWndProc = self._proc_keepalive
+            wc.hInstance = kernel32_instance = ctypes.windll.kernel32.GetModuleHandleW(None)
+            wc.lpszClassName = f"{APP_NAME}.ShowMeWindow"
+            user32.RegisterClassW(ctypes.byref(wc))
+            self.hwnd = user32.CreateWindowExW(
+                0, wc.lpszClassName, wc.lpszClassName, 0,
+                0, 0, 0, 0, wintypes.HWND(HWND_MESSAGE), 0,
+                kernel32_instance, None)
+        except Exception:
+            self.hwnd = None
+
+    def pump(self):
+        """Process pending messages for our hidden window (called via root.after)."""
+        if not self.hwnd:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+
+            class MSG(ctypes.Structure):
+                _fields_ = [("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                            ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                            ("time", wintypes.DWORD), ("pt_x", wintypes.LONG),
+                            ("pt_y", wintypes.LONG)]
+
+            msg = MSG()
+            PM_REMOVE = 1
+            while user32.PeekMessageW(ctypes.byref(msg), self.hwnd, 0, 0, PM_REMOVE):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            pass
+        return True
+
+
 def main():
     # Guard against launching several copies (each copy adds its own tray icon).
     if not acquire_single_instance():
-        sys.exit(0)  # another instance is already running - quit silently
+        # Another copy is already running: ask it to bring its window forward,
+        # then exit silently (no second window, no second tray icon).
+        notify_running_instance()
+        sys.exit(0)
     start_hidden = "--hidden" in sys.argv
     root = tk.Tk()
     logic = AppLogic()
-    GUI(root, logic, start_hidden=start_hidden)
+    gui = GUI(root, logic, start_hidden=start_hidden)
+
+    # Duplicate launches broadcast WM_SHOWME -> un-minimize our window.
+    listener = ShowMeListener(lambda: root.after(0, gui.show_window))
+    def _poll_showme():
+        listener.pump()
+        root.after(200, _poll_showme)
+    root.after(200, _poll_showme)
+
     root.mainloop()
 
 
