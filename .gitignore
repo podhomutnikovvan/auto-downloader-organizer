@@ -1,8 +1,6 @@
 __pycache__/
-*.pyc
-history.lognode_modules/
+*.pycnode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/

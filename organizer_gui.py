@@ -584,7 +584,14 @@ class AppLogic:
         # Paths that were ALREADY moved away successfully during this session.
         # Any later event for the same source path is ignored outright - this
         # is what finally kills the photo.jpg / photo (1).jpg / ... loop.
-        self._moved_done: set[str] = set()
+        # This map is NEVER cleared on purpose, so even a very long-running
+        # session cannot re-process an already-moved file (the previous
+        # time-based expiry was the root cause of endless photo.jpg /
+        # photo (1).jpg duplication after re-downloads).
+        self._moved_done: dict[str, float] = {}   # key -> mtime of handled file
+        # Files currently in the grace period / awaiting unlock: we remember
+        # their fingerprint so a stale retry never duplicates them.
+        self._seen: dict[str, float] = {}         # key -> mtime when first seen
         # Files that are waiting for their grace period / browser unlock.
         # A file enters this set when it is first seen in the watch folder
         # and leaves it once it has been successfully moved or abandoned.
@@ -634,6 +641,38 @@ class AppLogic:
     def _key(path) -> str:
         """Canonical string key for a path (case-folded on Windows)."""
         return os.path.normcase(str(path))
+
+    @staticmethod
+    def _fingerprint(path) -> tuple:
+        """Cheap version fingerprint of a file: (mtime, size).
+
+        Two different downloads that share one name almost never have the same
+        mtime AND size, while stale duplicate events for an already-handled
+        file always do - so comparing fingerprints lets us block duplicates
+        yet still move genuine re-downloads of the same file name.
+        """
+        try:
+            st = path.stat()
+            return (round(st.st_mtime, 3), st.st_size)
+        except OSError:
+            return (-1.0, -1)
+
+    def _handled(self, key: str, fp: tuple) -> bool:
+        """True if this exact file version was already moved away / abandoned.
+
+        Must be called with self._moving_lock held. Records freshly-seen files
+        in `_seen`; entries are promoted to `_moved_done` on success.
+        """
+        done = self._moved_done.get(key)
+        if done is not None and done == fp:
+            return True
+        seen = self._seen.get(key)
+        if seen is not None and seen == fp:
+            return True
+        # Remember this version as "in progress" so concurrent paths of the
+        # same file (event + sweeper + retry) collapse into one processing.
+        self._seen[key] = fp
+        return False
 
     def tr(self, key: str, *args) -> str:
         text = TRANSLATIONS[self.lang].get(key, key)
@@ -844,7 +883,14 @@ class AppLogic:
             # A file that was already successfully moved away, or that we have
             # abandoned, must NEVER be scheduled again. This is the guard that
             # kills the endless photo.jpg / photo (1).jpg duplication loop.
-            if key in self._moved_done or key not in self._awaiting:
+            # IMPORTANT: `_moved_done` stores the fingerprint of the file
+            # version we handled. A genuine re-download of the same name has a
+            # different fingerprint and is allowed through; stale events for
+            # the identical bytes are not.
+            done = self._moved_done.get(key)
+            if done is not None and done != (-1.0, -1):
+                return
+            if key not in self._awaiting:
                 return
             tries = self._retries.get(key, 0)
             if tries >= self._max_retries:
@@ -862,9 +908,8 @@ class AppLogic:
         src = Path(src_path)
         if not src.exists() or not src.is_file():
             return
-        # Hard guard against double-processing the same file concurrently
-        # (event thread + sweeper can both call us for one path).
         key = self._key(src)
+        fp = self._fingerprint(src)          # BEFORE the move (src disappears after it)
         with self._moving_lock:
             if key in self._moving:
                 return
@@ -873,7 +918,10 @@ class AppLogic:
             # (antivirus scan, browser re-touch, cloud sync, OneDrive) wakes
             # this path up later, we simply ignore it instead of creating
             # photo.jpg / photo (1).jpg / photo (2).jpg ... in the destination.
-            if key in self._moved_done:
+            # The fingerprint (mtime+size) distinguishes a stale duplicate
+            # event from a genuine re-download of the same file name: only an
+            # identical version is blocked, a new one passes through.
+            if self._handled(key, fp):
                 return
             self._moving.add(key)
             # A file we already moved away earlier must never be re-queued:
@@ -887,7 +935,7 @@ class AppLogic:
             else:
                 self._awaiting.add(key)
         try:
-            self._move_file_inner(src)
+            self._move_file_inner(src, fp)
         finally:
             with self._moving_lock:
                 self._moving.discard(key)
@@ -897,26 +945,34 @@ class AppLogic:
         with self._moving_lock:
             self._awaiting.discard(self._key(src))
 
-    def _mark_done(self, src: Path):
+    def _mark_done(self, src: Path, fp=None):
         """Remember that this source path was successfully moved away.
 
-        From now on every event for this exact path is ignored (see the
-        `_moved_done` guard in move_file). The key is dropped after 1 hour
-        so the set never grows unbounded during very long sessions; by then
-        any stale duplicate event would have fired already.
+        `fp` is the fingerprint captured BEFORE the file left the folder
+        (after shutil.move() the source no longer exists). From now on every
+        event for the SAME file version is ignored outright - this is what
+        finally kills the endless photo.jpg / photo (1).jpg duplication loop.
+        A genuine re-download of the same name produces a different
+        fingerprint and is therefore still handled normally. The bookkeeping
+        maps are trimmed to their newest entries so they never grow unbounded.
         """
         key = self._key(src)
+        if fp is None:
+            fp = self._fingerprint(src)
         with self._moving_lock:
-            self._moved_done.add(key)
+            self._moved_done[key] = fp
+            self._seen.pop(key, None)
             self._retries.pop(key, None)
             # _timers is keyed by the original Path object (see _schedule_retry),
             # so pop by `src`, not by the string `key`.
             self._timers.pop(src, None)
-        t = threading.Timer(3600, lambda: self._moved_done.discard(key))
-        t.daemon = True
-        t.start()
+            if len(self._moved_done) > 5000:
+                # Drop the oldest half; keep the newest records only.
+                for old in sorted(self._moved_done.items(),
+                                  key=lambda kv: kv[1][0])[:2500]:
+                    self._moved_done.pop(old[0], None)
 
-    def _move_file_inner(self, src: Path):
+    def _move_file_inner(self, src: Path, fp=None):
         try:
             age = time.time() - src.stat().st_mtime
         except OSError:
@@ -956,7 +1012,7 @@ class AppLogic:
             # The file vanished (user deleted/moved it) - nothing to do and,
             # crucially, NO duplicate was created.
             self._finish_awaiting(src)
-            self._mark_done(src)
+            self._mark_done(src, fp)
             return
         except PermissionError:
             self.log(self.tr("busy", src.name), "warn")
@@ -971,7 +1027,7 @@ class AppLogic:
         # records this path as "handled for good" so no later event can make
         # us create photo (1).jpg / photo (2).jpg ... duplicates again.
         self._finish_awaiting(src)         # done with this file for good
-        self._mark_done(src)
+        self._mark_done(src, fp)
         self.log(self.tr("moving", src.name, folder, dst.name), "move")
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
