@@ -573,10 +573,15 @@ class AppLogic:
         self._handler = None  # set by start_watch(); used for retry scheduling
         # Anti-duplication bookkeeping (see _schedule_retry / move_file):
         # per-file retry counters and a guard against concurrent processing.
-        self._retries: dict[Path, int] = {}
+        self._retries: dict[str, int] = {}   # path-key -> retry attempts left
+        self._timers: dict[str, float] = {}  # path-key -> epoch of next retry
         self._max_retries = 200          # hard cap -> no infinite loops ever
         self._moving: set[str] = set()   # paths currently being moved
         self._moving_lock = threading.Lock()
+        # Paths that were ALREADY moved away successfully during this session.
+        # Any later event for the same source path is ignored outright - this
+        # is what finally kills the photo.jpg / photo (1).jpg / ... loop.
+        self._moved_done: set[str] = set()
         # Files that are waiting for their grace period / browser unlock.
         # A file enters this set when it is first seen in the watch folder
         # and leaves it once it has been successfully moved or abandoned.
@@ -819,31 +824,33 @@ class AppLogic:
             return True               # unexpected error -> don't block sorting
 
     def _schedule_retry(self, src: Path, delay: float):
-        """Put a file back into the pending queue so sweep_loop retries it.
+        """Register a future retry of `src` in the dedicated timers dict.
 
-        IMPORTANT: we only reschedule when the file STILL EXISTS in the watch
-        folder. The previous version rescheduled unconditionally, which caused
-        an infinite duplicate loop: every failed move left the source file in
-        place while unique_path() happily created 'photo (1).jpg', then
-        'photo (2).jpg' ... forever. Now a failure logs ONE warning and the
-        file is retried at most `_max_retries` times before being skipped.
+        IMPORTANT: retries live in their OWN structure (`self._timers`), NOT
+        in the watchdog pending queue. Putting them back into `pending` was
+        the root cause of the infinite duplication bug: any on_modified /
+        on_created event (antivirus scan, browser touching the file, cloud
+        sync) refreshed the queue entry and re-triggered move_file(), while
+        unique_path() kept creating 'photo (1).jpg', 'photo (2).jpg' ...
+        A timer-based retry can only fire from itself, never from events.
         """
-        if self._handler is None or not src.exists():
+        if not src.exists():
             return
-        tries = self._retries.get(src, 0)
-        if tries >= self._max_retries:
-            self.log(self.tr("give_up", src.name), "warn")
-            self._retries.pop(src, None)
-            # Stop tracking this file for good: it stays in Downloads and no
-            # later event may re-queue it (prevents photo.jpg / photo (1).jpg
-            # / photo (2).jpg ... piling up in the destination folder).
-            self._awaiting.discard(self._key(src))
-            return
-        self._retries[src] = tries + 1
-        # last_activity is set so that (now - last) == settle_seconds - delay,
-        # i.e. sweep_loop will pick it up again after `delay` seconds.
-        settle = float(self.config["settle_seconds"])
-        self._handler.pending[src] = time.time() - max(0.0, settle - delay)
+        key = self._key(src)
+        with self._moving_lock:
+            # Already moved away earlier -> never schedule anything for it.
+            if key not in self._awaiting:
+                return
+            tries = self._retries.get(key, 0)
+            if tries >= self._max_retries:
+                self.log(self.tr("give_up", src.name), "warn")
+                self._retries.pop(key, None)
+                self._timers.pop(src, None)
+                self._awaiting.discard(key)   # stop tracking for good
+                return
+            self._retries[key] = tries + 1
+            # Keyed by the original Path object so sweep_loop can retry it.
+            self._timers[src] = time.time() + max(1.0, delay)
 
     def move_file(self, src_path: Path):
         src = Path(src_path)
@@ -854,6 +861,13 @@ class AppLogic:
         key = self._key(src)
         with self._moving_lock:
             if key in self._moving:
+                return
+            # THE anti-duplication guard: a file that was already successfully
+            # moved away earlier must never be processed again. If some event
+            # (antivirus scan, browser re-touch, cloud sync, OneDrive) wakes
+            # this path up later, we simply ignore it instead of creating
+            # photo.jpg / photo (1).jpg / photo (2).jpg ... in the destination.
+            if key in self._moved_done:
                 return
             self._moving.add(key)
             # A file we already moved away earlier must never be re-queued:
@@ -876,6 +890,23 @@ class AppLogic:
         """Remove a file from the awaiting set once it is truly done."""
         with self._moving_lock:
             self._awaiting.discard(self._key(src))
+
+    def _mark_done(self, src: Path):
+        """Remember that this source path was successfully moved away.
+
+        From now on every event for this exact path is ignored (see the
+        `_moved_done` guard in move_file). The key is dropped after 1 hour
+        so the set never grows unbounded during very long sessions; by then
+        any stale duplicate event would have fired already.
+        """
+        key = self._key(src)
+        with self._moving_lock:
+            self._moved_done.add(key)
+            self._retries.pop(key, None)
+            self._timers.pop(key, None)
+        t = threading.Timer(3600, lambda: self._moved_done.discard(key))
+        t.daemon = True
+        t.start()
 
     def _move_file_inner(self, src: Path):
         try:
@@ -916,8 +947,8 @@ class AppLogic:
         except FileNotFoundError:
             # The file vanished (user deleted/moved it) - nothing to do and,
             # crucially, NO duplicate was created.
-            self._retries.pop(src, None)
             self._finish_awaiting(src)
+            self._mark_done(src)
             return
         except PermissionError:
             self.log(self.tr("busy", src.name), "warn")
@@ -925,12 +956,14 @@ class AppLogic:
             return
         except Exception as e:
             self.log(self.tr("error_move", src.name, e), "error")
-            self._retries.pop(src, None)   # do not spam retries on real errors
-            self._finish_awaiting(src)     # stop tracking -> no duplicates
+            # Do not spam retries on real errors: stop tracking the file.
+            self._finish_awaiting(src)
             return
-        # Success: clear retry counters and log the move.
-        self._retries.pop(src, None)
+        # Success: clear retry counters and log the move. _mark_done() also
+        # records this path as "handled for good" so no later event can make
+        # us create photo (1).jpg / photo (2).jpg ... duplicates again.
         self._finish_awaiting(src)         # done with this file for good
+        self._mark_done(src)
         self.log(self.tr("moving", src.name, folder, dst.name), "move")
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
@@ -988,12 +1021,24 @@ class AppLogic:
         def sweep_loop():
             while self.running:
                 now = time.time()
+                # 1) Freshly-seen files whose activity has settled down.
                 for path, last in list(handler.pending.items()):
                     if not path.exists():
                         handler.pending.pop(path, None)
                         continue
                     if now - last >= float(self.config["settle_seconds"]):
                         handler.pending.pop(path, None)
+                        self.move_file(path)
+                # 2) Scheduled retries (grace period / busy file). These live
+                #    in their own timer dict so filesystem events can never
+                #    re-arm them -> no infinite duplicate loop.
+                # The timer dict keeps the ORIGINAL Path as its key (see
+                # _schedule_retry), so we can retry it directly.
+                for path, when in list(self._timers.items()):
+                    if now < when:
+                        continue
+                    self._timers.pop(path, None)
+                    if path.parent == watch_dir and path.exists():
                         self.move_file(path)
                 time.sleep(1)
 
