@@ -339,13 +339,18 @@ def is_autostart_enabled() -> bool:
 
 _single_instance_handle = None  # keep the mutex handle alive for the whole run
 
+# Custom message used by a second (duplicate) launch to tell the first
+# instance "show your window". WM_APP + 1 is in the range reserved for apps.
+WM_SHOWME = 0x8000 + 1  # WM_APP(0x8000) + 1
+
 
 def acquire_single_instance() -> bool:
     """Ensure only ONE copy of the app runs at a time (Windows named mutex).
 
     Multiple running copies is the main reason users see several identical
     tray icons. If another instance already holds the mutex, we return False
-    and the caller exits immediately without creating any window or icon.
+    and the caller notifies the running instance (see notify_running_instance)
+    before exiting without creating any window or icon.
     On non-Windows systems the check is skipped (returns True).
     """
     global _single_instance_handle
@@ -365,6 +370,21 @@ def acquire_single_instance() -> bool:
         return True
     except Exception:
         return True
+
+
+def notify_running_instance() -> None:
+    """Second-launch helper: broadcast WM_SHOWME so the first instance
+    un-minimizes its window instead of silently doing nothing."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        HWND_BROADCAST = 0xFFFF
+        WM_SHOWME_MSG = WM_SHOWME
+        user32.PostMessageW(HWND_BROADCAST, WM_SHOWME_MSG, 0, 0)
+    except Exception:
+        pass  # cosmetic only - never crash a duplicate launcher
 
 
 def make_tray_image(running: bool):
