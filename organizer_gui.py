@@ -901,125 +901,40 @@ class GUI:
                                    "Could not write the Windows autostart registry key.")
 
     # ------------------------------ tray logic ----------------------------- #
-    def _kill_zombie_icons(self):
-        """Remove tray icons left behind by previous crashed/killed instances.
+    def _refresh_tray_area(self):
+        """Ask the taskbar to refresh the notification area (safe, no hacks).
 
-        Windows does NOT clean up notification-area icons of processes that
-        died without calling Shell_NotifyIcon(NIM_DELETE); they stay visible
-        until the user hovers over them. We enumerate the toolbar window and
-        delete every icon whose tooltip matches our app title, so at most one
-        live icon remains after startup.
+        This is the officially supported trick: broadcasting TaskbarCreated
+        makes explorer rebuild the tray, which drops "ghost" icons left by
+        processes that died without cleaning up. It is read-only for other
+        apps and cannot crash the shell.
         """
         if sys.platform != "win32":
             return
         try:
             import ctypes
-            from ctypes import wintypes
-
             user32 = ctypes.windll.user32
-            shell32 = ctypes.windll.shell32
-
-            class NOTIFYICONDATAW(ctypes.Structure):
-                _fields_ = [
-                    ("cbSize", wintypes.DWORD),
-                    ("hWnd", wintypes.HWND),
-                    ("uID", wintypes.UINT),
-                    ("uFlags", wintypes.UINT),
-                    ("uCallbackMessage", wintypes.UINT),
-                    ("hIcon", wintypes.HICON),
-                    ("uTooltip", wintypes.WCHAR * 128),
-                    ("uVersion", wintypes.UINT),
-                    ("szInfo", wintypes.WCHAR * 256),
-                    ("Unknown1", wintypes.UINT),
-                    ("Unknown2", ctypes.c_void_p),
-                    ("Unknown3", ctypes.c_void_p),
-                    ("szInfoTitle", wintypes.WCHAR * 64),
-                    ("Unknown4", wintypes.UINT),
-                ]
-
-            NIF_TIP = 0x00000004
-            NIM_DELETE = 0x00000002
-
-            # The hidden toolbar window that hosts legacy notification icons.
-            hwnd_toolbar = user32.FindWindowW("Shell_TrayWnd", None)
-            hwnd_toolbar = user32.FindWindowExW(hwnd_toolbar, 0, "TrayNotifyWnd", None)
-            hwnd_toolbar = user32.FindWindowExW(hwnd_toolbar, 0, "SysPager", None)
-            hwnd_toolbar = user32.FindWindowExW(hwnd_toolbar, 0, "ToolbarWindow32", None)
-            if not hwnd_toolbar:
-                return
-
-            process_id = wintypes.DWORD()
-            kernel32 = ctypes.windll.kernel32
-            OpenProcess = kernel32.OpenProcess
-            OpenProcess.restype = wintypes.HANDLE
-            OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            VirtualAllocEx = kernel32.VirtualAllocEx
-            VirtualAllocEx.restype = wintypes.LPVOID
-            VirtualAllocEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID,
-                                       ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
-            ReadProcessMemory = kernel32.ReadProcessMemory
-            ReadProcessMemory.restype = wintypes.BOOL
-            WriteProcessMemory = kernel32.WriteProcessMemory
-            WriteProcessMemory.restype = wintypes.BOOL
-            VirtualFreeEx = kernel32.VirtualFreeEx
-            CloseHandle = kernel32.CloseHandle
-
-            user32.GetWindowThreadProcessId(hwnd_toolbar, ctypes.byref(process_id))
-            h_process = OpenProcess(0x001F0FFF, False, process_id.value)  # PROCESS_ALL_ACCESS
-            if not h_process:
-                return
-
-            size = ctypes.sizeof(NOTIFYICONDATAW)
-            remote_mem = VirtualAllocEx(h_process, None, size, 0x1000 | 0x2000, 0x04)
-            if not remote_mem:
-                CloseHandle(h_process)
-                return
-
-            # Tooltip text used by this app (both languages, to catch old copies).
-            my_tips = {t["title"] for t in TRANSLATIONS.values()}
-            found_any = False
-            index = 0
-            while True:
-                count = user32.SendMessageW(hwnd_toolbar, 0x0414, index, 0)  # TB_BUTTONCOUNT
-                if count <= index:
-                    break
-                ok = user32.SendMessageW(hwnd_toolbar, 0x0418, index, remote_mem)  # TB_GETBUTTON
-                if ok:
-                    button_data = (ctypes.c_byte * 24)()
-                    ReadProcessMemory(h_process, remote_mem, ctypes.byref(button_data),
-                                      size, None)
-                    param_addr = int.from_bytes(button_data[12:20], "little")
-                    nid = NOTIFYICONDATAW()
-                    nid.cbSize = size
-                    ok2 = user32.SendMessageW(hwnd_toolbar, 0x0417, param_addr, remote_mem)  # TB_GETPARAM
-                    if ok2:
-                        ReadProcessMemory(h_process, remote_mem, ctypes.byref(nid),
-                                          size, None)
-                        tip = nid.uTooltip.rstrip("\x00")
-                        if tip in my_tips:
-                            nid.uFlags = NIF_TIP
-                            WriteProcessMemory(h_process, remote_mem, ctypes.byref(nid),
-                                               size, None)
-                            shell32.Shell_NotifyIconW(NIM_DELETE, remote_mem)
-                            found_any = True
-                index += 1
-            VirtualFreeEx(h_process, remote_mem, 0, 0x8000)  # MEM_RELEASE
-            CloseHandle(h_process)
-            if found_any:
-                # Force the taskbar to repaint and drop the dead slots.
-                user32.SendMessageW(user32.FindWindowW("Shell_TrayWnd", None),
-                                    0x001B, 0, 0)  # WM_PAINT-ish refresh hint
+            hwnd = user32.RegisterWindowMessageW("TaskbarCreated")
+            if hwnd:
+                # HWND_BROADCAST = 0xFFFF, WM_USER-less broadcast, no wait.
+                user32.PostMessageW(0xFFFF, hwnd, 0, 0)
         except Exception:
-            pass  # purely cosmetic cleanup - never break startup over it
+            pass  # purely cosmetic - never break startup over it
 
     def ensure_tray_icon(self):
-        """Create the pystray icon once (runs its own daemon thread)."""
-        if not TRAY_AVAILABLE or self.tray_icon is not None:
+        """Create the pystray icon once (runs its own daemon thread).
+
+        IMPORTANT (performance/stability): we must NEVER touch other
+        processes' memory here. An earlier version enumerated the tray
+        toolbar via ReadProcessMemory/WriteProcessMemory; SendMessage calls
+        into the shell hung the UI thread and could even bring down
+        explorer.exe. Now icon creation is a plain local operation and the
+        only shell interaction is a single PostMessage broadcast.
+        """
+        if not TRAY_AVAILABLE or self.tray_icon is not None or self.exiting:
             return
-        # First launch of this session: sweep leftover icons from old runs.
-        if getattr(self, "_zombies_cleaned", False) is False:
-            self._zombies_cleaned = True
-            self._kill_zombie_icons()
+        # Sweep visual ghosts left by previous crashed runs (non-blocking).
+        self._refresh_tray_area()
         # NOTE: pystray evaluates the *text* of a menu item by calling it with
         # the MenuItem instance as argument (text(item)), while *visible* is
         # called the same way. Callbacks receive (icon, item). Lambdas below
