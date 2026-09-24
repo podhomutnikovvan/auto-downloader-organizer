@@ -25,6 +25,7 @@ Dependencies: pip install watchdog pystray pillow
 """
 
 import json
+import os
 import shutil
 import sys
 import threading
@@ -104,6 +105,7 @@ TRANSLATIONS = {
         "skipped": "Skipped (still downloading): {}",
         "error_move": "Could not move {}: {}",
         "busy": "File is busy, will retry: {}",
+        "in_list": "Still in the browser download list, waiting: {}",
         "hint": "Tip: closing the window minimizes it to the tray and keeps sorting.",
         # Tray / startup options
         "opt_tray": "Minimize to system tray (keep running when window is closed)",
@@ -147,6 +149,7 @@ TRANSLATIONS = {
         "skipped": "Пропуск (ещё качается): {}",
         "error_move": "Не удалось переместить {}: {}",
         "busy": "Файл занят, повторю позже: {}",
+        "in_list": "Файл ещё в списке загрузок браузера, жду: {}",
         "hint": "Подсказка: закрытие окна сворачивает его в трей — сортировка продолжается.",
         # Tray / startup options
         "opt_tray": "Сворачивать в трей (работать при закрытом окне)",
@@ -190,6 +193,7 @@ TRANSLATIONS = {
         "skipped": "跳过（仍在下载）：{}",
         "error_move": "无法移动 {}：{}",
         "busy": "文件被占用，稍后重试：{}",
+        "in_list": "文件仍在浏览器下载列表中，等待：{}",
         "hint": "提示：关闭窗口会最小化到托盘，整理继续进行。",
         # Tray / startup options
         "opt_tray": "最小化到系统托盘（关闭窗口后继续运行）",
@@ -577,6 +581,10 @@ class AppLogic:
             "watch_dir": str(Path.home() / "Downloads"),
             "dest_dir": str(Path.home() / "Downloads" / "Sorted"),
             "settle_seconds": 3,
+            # How long we wait for the browser to finish with a file before
+            # moving it anyway (seconds). Prevents breaking "Show in folder"
+            # links in the browser's own downloads list.
+            "grace_seconds": 60,
             # Tray mode: minimize-to-tray is ON by default; autostart is OFF
             # until the user ticks the checkbox (it writes to the registry).
             "minimize_to_tray": True,
@@ -626,10 +634,86 @@ class AppLogic:
         except Exception:
             pass
 
+    # --------------------- browser download-list awareness ------------------ #
+    def _browser_history_files(self):
+        """Yield History/History.sqlite files of Chromium and Firefox profiles.
+
+        The browser's own downloads list ("Ctrl+J" page) lives in these
+        databases. Reading them lets us detect downloads that are finished on
+        disk but still listed as active/clickable in the browser UI - moving
+        such a file would break the "show in folder" link there.
+        """
+        local = os.environ.get("LOCALAPPDATA", "")
+        roaming = os.environ.get("APPDATA", "")
+        chrome_user = Path(local) / "Google" / "Chrome" / "User Data" if local else None
+        if chrome_user and chrome_user.is_dir():
+            for prof in sorted(chrome_user.iterdir()):
+                hist = prof / "History"
+                if hist.is_file():
+                    yield hist
+        ff_root = Path(roaming) / "Mozilla" / "Firefox" / "Profiles" if roaming else None
+        if ff_root and ff_root.is_dir():
+            for prof in sorted(ff_root.iterdir()):
+                hist = prof / "places.sqlite"
+                if hist.is_file():
+                    yield hist
+
+    def _file_in_browser_list(self, name: str) -> bool:
+        """True if `name` still appears as an unfinished download in any
+        browser history database. Fail-open: any error means 'not found'."""
+        deadline = time.time() + 0.5   # never block the mover thread long
+        try:
+            import sqlite3
+        except Exception:
+            return False
+        like = "%" + name.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
+        queries = [
+            # Chrome/Edge: state 0=in progress, 1=complete, 2=cancelled,
+            # 3=interrupted, 4=warning. Anything not fully complete counts.
+            ("SELECT COUNT(*) FROM downloads WHERE current_path LIKE ? AND state != 1",),
+            ("SELECT COUNT(*) FROM downloads WHERE target_path LIKE ? AND state != 1",),
+            # Firefox places.sqlite: use a read-only URI copy approach below.
+            ("SELECT COUNT(*) FROM moz_annos WHERE content LIKE ?",),
+        ]
+        for hist in self._browser_history_files():
+            if time.time() > deadline:
+                break
+            try:
+                uri = f"file:{hist.as_posix()}?mode=ro&immutable=1"
+                con = sqlite3.connect(uri, timeout=0.2, uri=True)
+                try:
+                    cur = con.cursor()
+                    for (sql,) in queries:
+                        try:
+                            cur.execute(sql, (like,))
+                            if cur.fetchone()[0] > 0:
+                                return True
+                        except sqlite3.Error:
+                            continue  # table missing in this DB - try next
+                finally:
+                    con.close()
+            except Exception:
+                continue  # locked / not readable - just skip this profile
+        return False
+
     # ------------------------------ file moving ---------------------------- #
     def move_file(self, src_path: Path):
         src = Path(src_path)
         if not src.exists() or not src.is_file():
+            return
+        # Do not steal a file the browser still lists as an active download:
+        # its "Show in folder" button would then fail with "file moved".
+        # Re-check it soon; after GRACE_SECONDS we sort anyway so the queue
+        # can never be blocked forever by stale browser entries.
+        try:
+            age = time.time() - src.stat().st_mtime
+        except OSError:
+            age = 0.0
+        grace = float(self.config.get("grace_seconds", 60))
+        if age < grace and self._file_in_browser_list(src.name):
+            self.log(self.tr("in_list", src.name), "warn")
+            if self._handler is not None:
+                self._handler.pending[src] = time.time() - self.config["settle_seconds"] + 2
             return
         folder = self.category_for(src.name)
         dst_dir = Path(self.config["dest_dir"]) / folder

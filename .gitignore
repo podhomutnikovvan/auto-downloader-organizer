@@ -1,6 +1,7 @@
-__pycache__/node_modules/
+# Compiled files
+__pycache__/
+*.pycnode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/
