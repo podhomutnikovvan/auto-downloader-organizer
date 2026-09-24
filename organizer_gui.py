@@ -860,18 +860,28 @@ class GUI:
         """Create the pystray icon once (runs its own daemon thread)."""
         if not TRAY_AVAILABLE or self.tray_icon is not None:
             return
+        # NOTE: pystray evaluates the *text* of a menu item by calling it with
+        # the MenuItem instance as argument (text(item)), while *visible* is
+        # called the same way. Callbacks receive (icon, item). Lambdas below
+        # must therefore accept those arguments explicitly.
+        def _txt(key):
+            return lambda _item=None: self.logic.tr(key)
+
+        def _vis(running_value):
+            return lambda _item=None: self.logic.running == running_value
+
         menu = pystray.Menu(
-            pystray.MenuItem(lambda: self.logic.tr("tray_show"),
+            pystray.MenuItem(_txt("tray_show"),
                              lambda icon, item: self.root.after(0, self.show_window),
                              default=True),
-            pystray.MenuItem(lambda: self.logic.tr("tray_start"),
+            pystray.MenuItem(_txt("tray_start"),
                              lambda icon, item: self.root.after(0, self.tray_start),
-                             visible=lambda item: not self.logic.running),
-            pystray.MenuItem(lambda: self.logic.tr("tray_stop"),
+                             visible=_vis(False)),
+            pystray.MenuItem(_txt("tray_stop"),
                              lambda icon, item: self.root.after(0, self.tray_stop),
-                             visible=lambda item: self.logic.running),
+                             visible=_vis(True)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(lambda: self.logic.tr("tray_exit"),
+            pystray.MenuItem(_txt("tray_exit"),
                              lambda icon, item: self.root.after(0, self.exit_app)),
         )
         self.tray_icon = pystray.Icon(
