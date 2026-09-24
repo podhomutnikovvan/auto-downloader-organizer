@@ -1,6 +1,7 @@
-(empty)node_modules/
+__pycache__/
+*.pyc
+history.lognode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/

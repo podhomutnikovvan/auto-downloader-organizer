@@ -574,8 +574,11 @@ class AppLogic:
         # Anti-duplication bookkeeping (see _schedule_retry / move_file):
         # per-file retry counters and a guard against concurrent processing.
         self._retries: dict[str, int] = {}   # path-key -> retry attempts left
-        self._timers: dict[str, float] = {}  # path-key -> epoch of next retry
-        self._max_retries = 200          # hard cap -> no infinite loops ever
+        self._timers: dict[Path, float] = {} # ORIGINAL Path obj -> epoch of retry
+        # Hard cap on retries. With the default check interval (~5 s) this is
+        # ~15 minutes max per file; after that we give up and leave it alone.
+        # A finite cap is what finally kills any runaway re-queue loop.
+        self._max_retries = 180
         self._moving: set[str] = set()   # paths currently being moved
         self._moving_lock = threading.Lock()
         # Paths that were ALREADY moved away successfully during this session.
@@ -838,8 +841,10 @@ class AppLogic:
             return
         key = self._key(src)
         with self._moving_lock:
-            # Already moved away earlier -> never schedule anything for it.
-            if key not in self._awaiting:
+            # A file that was already successfully moved away, or that we have
+            # abandoned, must NEVER be scheduled again. This is the guard that
+            # kills the endless photo.jpg / photo (1).jpg duplication loop.
+            if key in self._moved_done or key not in self._awaiting:
                 return
             tries = self._retries.get(key, 0)
             if tries >= self._max_retries:
@@ -849,7 +854,8 @@ class AppLogic:
                 self._awaiting.discard(key)   # stop tracking for good
                 return
             self._retries[key] = tries + 1
-            # Keyed by the original Path object so sweep_loop can retry it.
+            # Keyed by the ORIGINAL Path object (same identity as everywhere
+            # else) so the sweeper and every pop() use one consistent key.
             self._timers[src] = time.time() + max(1.0, delay)
 
     def move_file(self, src_path: Path):
@@ -903,7 +909,9 @@ class AppLogic:
         with self._moving_lock:
             self._moved_done.add(key)
             self._retries.pop(key, None)
-            self._timers.pop(key, None)
+            # _timers is keyed by the original Path object (see _schedule_retry),
+            # so pop by `src`, not by the string `key`.
+            self._timers.pop(src, None)
         t = threading.Timer(3600, lambda: self._moved_done.discard(key))
         t.daemon = True
         t.start()
