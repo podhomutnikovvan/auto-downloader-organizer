@@ -512,15 +512,41 @@ def create_shared_flag() -> None:
         pass
 
 
+def load_app_icon():
+    """Load app.png / app.ico from the exe folder (or next to this script).
+
+    Returns an RGBA PIL image or None when no icon file is found. This keeps
+    the tray icon visually identical to the taskbar/exe icon produced by
+    PyInstaller --icon=app.ico.
+    """
+    for cand in (BASE_DIR / "app.png", BASE_DIR / "app.ico"):
+        try:
+            if cand.exists():
+                return Image.open(cand).convert("RGBA")
+        except Exception:
+            pass
+    return None
+
+
 def make_tray_image(running: bool):
-    """Draw a simple 64x64 icon: green circle = sorting on, gray = paused."""
-    color = (46, 204, 113, 255) if running else (139, 147, 167, 255)
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    """Tray icon: the real app artwork + a small status dot.
+
+    Green dot = sorting on, gray dot = paused. If app.png/app.ico is missing
+    we fall back to a simple drawn badge so the app never crashes on startup.
+    """
+    base = load_app_icon()
+    if base is not None:
+        img = base.resize((64, 64), Image.LANCZOS).copy()
+    else:
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d0 = ImageDraw.Draw(img)
+        d0.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(30, 34, 45, 255))
+        d0.ellipse((12, 12, 52, 52), fill=(79, 140, 255, 255))
+        d0.polygon([(32, 44), (20, 26), (44, 26)], fill=(255, 255, 255, 255))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(30, 34, 45, 255))
-    d.ellipse((12, 12, 52, 52), fill=color)
-    # White down-arrow symbolizing "downloads sorted into folders".
-    d.polygon([(32, 44), (20, 26), (44, 26)], fill=(255, 255, 255, 255))
+    color = (46, 204, 113, 255) if running else (139, 147, 167, 255)
+    # Status dot in the bottom-right corner with a dark ring for contrast.
+    d.ellipse((40, 40, 62, 62), fill=color, outline=(30, 34, 45, 255), width=3)
     return img
 
 
@@ -749,6 +775,18 @@ class GUI:
             root.tk.call("tk", "scaling", 1.25)  # consistent paddings on HiDPI
         except Exception:
             pass
+
+        # Window/taskbar icon: prefer app.ico (same artwork as the exe icon).
+        for ico in (BASE_DIR / "app.ico", BASE_DIR / "app.png"):
+            if ico.exists():
+                try:
+                    if ico.suffix == ".ico":
+                        root.iconbitmap(str(ico))
+                    else:
+                        root.iconphoto(True, tk.PhotoImage(file=str(ico)))
+                    break
+                except Exception:
+                    pass  # cosmetic only - never crash over an icon
 
         # ================= header card ================= #
         header = tk.Frame(root, bg=CARD)
