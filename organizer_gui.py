@@ -11,15 +11,22 @@ Features
 * User-selectable UI language: English / Русский / 中文 (dropdown in the
   window). The choice is persisted in config.json; on first run it is
   auto-detected from the system locale.
+* System-tray mode: "minimize to tray" checkbox + "--hidden" command-line
+  flag let the app start silently in the background and keep sorting even
+  when the window is closed (tray icon: left-click opens the window,
+  right-click menu has Show / Start / Stop / Exit).
 * All source comments are written in English.
 
-Run:      python organizer_gui.py
-Build:    python -m PyInstaller --onefile --noconsole organizer_gui.py
+Run:          python organizer_gui.py
+Run hidden:   python organizer_gui.py --hidden
+Build:        python -m PyInstaller --onefile --noconsole organizer_gui.py
+Dependencies: pip install watchdog pystray pillow
 """
 
 import json
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -31,6 +38,18 @@ try:
     from watchdog.observers import Observer
 except ImportError:
     sys.exit("Missing dependency 'watchdog'. Install it with:  pip install watchdog")
+
+# Optional tray support. If pystray/pillow are missing (or there is no
+# display yet) the app still works, but the tray options are not shown.
+# The import itself can also fail on Linux without an X server, so we catch
+# broadly here; the real backend check happens again in GUI.__init__.
+TRAY_AVAILABLE = False
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except Exception:
+    pass
 
 # --------------------------------------------------------------------------- #
 # Paths. When frozen by PyInstaller we use the folder of the executable,
@@ -65,6 +84,14 @@ TRANSLATIONS = {
         "skipped": "Skipped (still downloading): {}",
         "error_move": "Could not move {}: {}",
         "busy": "File is busy, will retry: {}",
+        # Tray / startup options
+        "opt_tray": "Minimize to system tray (keep running when window is closed)",
+        "opt_autostart": "Start automatically with Windows",
+        "opt_hidden": "Launch hidden in the tray on startup",
+        "tray_show": "Show window",
+        "tray_start": "Start sorting",
+        "tray_stop": "Stop sorting",
+        "tray_exit": "Exit",
         # Category folder names
         "cat_documents": "Documents",
         "cat_tables": "Spreadsheets",
@@ -96,6 +123,14 @@ TRANSLATIONS = {
         "skipped": "Пропуск (ещё качается): {}",
         "error_move": "Не удалось переместить {}: {}",
         "busy": "Файл занят, повторю позже: {}",
+        # Tray / startup options
+        "opt_tray": "Сворачивать в трей (работать при закрытом окне)",
+        "opt_autostart": "Запускать автоматически вместе с Windows",
+        "opt_hidden": "При запуске сразу сворачиваться в трей",
+        "tray_show": "Открыть окно",
+        "tray_start": "Запустить сортировку",
+        "tray_stop": "Остановить сортировку",
+        "tray_exit": "Выход",
         # Category folder names
         "cat_documents": "Документы",
         "cat_tables": "Таблицы",
@@ -127,6 +162,14 @@ TRANSLATIONS = {
         "skipped": "跳过（仍在下载）：{}",
         "error_move": "无法移动 {}：{}",
         "busy": "文件被占用，稍后重试：{}",
+        # Tray / startup options
+        "opt_tray": "最小化到系统托盘（关闭窗口后继续运行）",
+        "opt_autostart": "随 Windows 自动启动",
+        "opt_hidden": "启动时直接隐藏到托盘",
+        "tray_show": "显示窗口",
+        "tray_start": "开始整理",
+        "tray_stop": "停止整理",
+        "tray_exit": "退出",
         # Category folder names
         "cat_documents": "文档",
         "cat_tables": "表格",
@@ -216,6 +259,67 @@ def detect_system_language() -> str:
     return "en"
 
 
+# --------------------------------------------------------------------------- #
+# Windows autostart helpers. The entry lives in HKCU\...\Run, so no admin
+# rights are required and it points either to the frozen .exe or to
+# "pythonw.exe organizer_gui.py --hidden" for script runs.
+# --------------------------------------------------------------------------- #
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APP_NAME = "AutoDownloaderOrganizer"
+
+
+def current_launch_command() -> str:
+    """Command line used to (re)launch this app hidden in the tray."""
+    if getattr(sys, "frozen", False):                      # running as .exe
+        return f'"{Path(sys.executable).resolve()}" --hidden'
+    script = Path(__file__).resolve()
+    return f'"{sys.executable}" "{script}" --hidden'       # pythonw.exe + script
+
+
+def set_autostart(enable: bool) -> bool:
+    """Write/remove the Run key. Returns True on success (no-op on non-Windows)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            if enable:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
+                                  current_launch_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def is_autostart_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+        return True
+    except Exception:
+        return False
+
+
+def make_tray_image(running: bool):
+    """Draw a simple 64x64 icon: green circle = sorting on, gray = paused."""
+    color = (76, 175, 80, 255) if running else (158, 158, 158, 255)
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((6, 6, 58, 58), fill=color)
+    # White down-arrow symbolizing "downloads sorted into folders".
+    d.polygon([(32, 46), (18, 26), (46, 26)], fill=(255, 255, 255, 255))
+    return img
+
+
 class AppLogic:
     """All non-GUI behaviour: configuration, classification, moving, watching."""
 
@@ -224,11 +328,12 @@ class AppLogic:
         self.observer = None
         self.running = False
         self._handler = None  # set by start_watch(); used for retry scheduling
+        # Callbacks are wired up by the GUI / tray layer.
+        self.gui_callback = lambda msg: None   # translated log line -> window
+        self.state_callback = lambda: None     # running-state changed -> refresh UI
         self.lang = self.config.get("language") or detect_system_language()
         if self.lang not in TRANSLATIONS:
             self.lang = "en"
-        # gui_callback receives a translated message string; set by the GUI layer.
-        self.gui_callback = lambda msg: None
 
     # ---------------------------- configuration ---------------------------- #
     def load_config(self) -> dict:
@@ -242,6 +347,11 @@ class AppLogic:
             "watch_dir": str(Path.home() / "Downloads"),
             "dest_dir": str(Path.home() / "Downloads" / "Sorted"),
             "settle_seconds": 3,
+            # Tray mode: minimize-to-tray is ON by default; autostart is OFF
+            # until the user ticks the checkbox (it writes to the registry).
+            "minimize_to_tray": True,
+            "start_hidden": False,
+            "autostart": False,
         }
 
     def save_config(self):
@@ -376,6 +486,7 @@ class AppLogic:
         self.running = True
         threading.Thread(target=sweep_loop, daemon=True).start()
         self.log(self.tr("started", watch_dir, self.config["dest_dir"]))
+        self.state_callback()  # let GUI/tray refresh button + icon colour
 
     def stop_watch(self):
         if self.observer:
@@ -383,15 +494,19 @@ class AppLogic:
             self.observer.join()
             self.running = False
             self.log(self.tr("stopped"))
+            self.state_callback()
 
 
 class GUI:
-    """Tkinter window: language dropdown, folder pickers, start/stop, log."""
+    """Tkinter window: language dropdown, folder pickers, start/stop, log, tray."""
 
-    def __init__(self, root: tk.Tk, logic: AppLogic):
+    def __init__(self, root: tk.Tk, logic: AppLogic, start_hidden: bool = False):
         self.root = root
         self.logic = logic
+        self.tray_icon = None       # pystray icon, created lazily
+        self.exiting = False        # set True only via the real "Exit" action
         logic.gui_callback = self.append_log
+        logic.state_callback = lambda: root.after(0, self.refresh_texts)
 
         self.var_lang = tk.StringVar(value=LANGUAGE_NAMES[logic.lang])
         self.entries = {}
@@ -438,17 +553,49 @@ class GUI:
 
         # --- event log ----------------------------------------------------- #
         txt_frame = tk.Frame(root)
-        txt_frame.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        txt_frame.pack(fill="both", expand=True, padx=20, pady=(0, 5))
         self.lbl_log = tk.Label(txt_frame, anchor="w")
         self.lbl_log.pack(fill="x")
-        self.txt_log = tk.Text(txt_frame, height=9, state="disabled",
+        self.txt_log = tk.Text(txt_frame, height=8, state="disabled",
                                bg="#f0f0f0", font=("Consolas", 9))
         scrollbar = tk.Scrollbar(txt_frame, command=self.txt_log.yview)
         self.txt_log.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.txt_log.pack(side="left", fill="both", expand=True)
 
+        # --- options row: tray / autostart / start-hidden ------------------ #
+        opts = tk.Frame(root)
+        opts.pack(fill="x", padx=20, pady=(0, 12))
+
+        def make_check(key: str, command):
+            var = tk.BooleanVar(value=bool(logic.config.get(key, False)))
+            cb = tk.Checkbutton(opts, text="", variable=var, command=command)
+            cb.pack(anchor="w")
+            return cb, var
+
+        self.cb_tray, self.var_tray = make_check("minimize_to_tray", self.on_tray_option)
+        self.cb_hidden, self.var_hidden = make_check("start_hidden", self.on_hidden_option)
+        if TRAY_AVAILABLE:
+            self.cb_autostart, self.var_autostart = make_check("autostart", self.on_autostart_option)
+            self.var_autostart.set(is_autostart_enabled())  # trust the registry
+        else:
+            self.cb_autostart, self.var_autostart = None, None
+
+        # --- window close behaviour & tray icon ----------------------------- #
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_texts()
+
+        if start_hidden or logic.config.get("start_hidden", False):
+            # Autostart mode: no window at all, sorting runs from the tray.
+            self.hide_to_tray()
+            if not logic.running:
+                try:
+                    logic.start_watch()
+                except Exception as e:
+                    messagebox.showerror(logic.tr("error"), str(e))
+                    self.show_window()
+        elif TRAY_AVAILABLE:
+            self.ensure_tray_icon()  # icon appears right away for convenience
 
     # ------------------------- language handling --------------------------- #
     def refresh_texts(self):
@@ -459,10 +606,20 @@ class GUI:
         self.lbl_watch.config(text=tr("watch_label"))
         self.lbl_dest.config(text=tr("dest_label"))
         self.lbl_log.config(text=tr("log_header"))
+        self.cb_tray.config(text=tr("opt_tray"))
+        self.cb_hidden.config(text=tr("opt_hidden"))
+        if self.cb_autostart is not None:
+            self.cb_autostart.config(text=tr("opt_autostart"))
         self.btn_toggle.config(
             text=self.logic.tr("btn_stop") if self.logic.running
             else self.logic.tr("btn_start")
         )
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.title = tr("title")
+                self.tray_icon.icon = make_tray_image(self.logic.running)
+            except Exception:
+                pass  # tray may be mid-shutdown; ignore cosmetic failures
 
     def on_language_change(self, _event=None):
         chosen = next(k for k, v in LANGUAGE_NAMES.items()
@@ -494,9 +651,7 @@ class GUI:
 
     def toggle(self):
         if not self.logic.running:
-            self.logic.config["watch_dir"] = self.entry_watch.get().strip()
-            self.logic.config["dest_dir"] = self.entry_dest.get().strip()
-            self.logic.save_config()
+            self.save_dirs()
             try:
                 self.logic.start_watch()
             except Exception as e:
@@ -511,18 +666,104 @@ class GUI:
             self.entry_watch.config(state="normal")
             self.entry_dest.config(state="normal")
 
+    def save_dirs(self):
+        """Persist the two folder paths into config.json."""
+        self.logic.config["watch_dir"] = self.entry_watch.get().strip()
+        self.logic.config["dest_dir"] = self.entry_dest.get().strip()
+        self.logic.save_config()
+
+    # --------------------------- option handlers --------------------------- #
+    def on_tray_option(self):
+        self.logic.config["minimize_to_tray"] = self.var_tray.get()
+        self.logic.save_config()
+
+    def on_hidden_option(self):
+        self.logic.config["start_hidden"] = self.var_hidden.get()
+        self.logic.save_config()
+
+    def on_autostart_option(self):
+        enable = self.var_autostart.get()
+        self.save_dirs()  # keep folders saved before registering autostart
+        if set_autostart(enable):
+            self.logic.config["autostart"] = enable
+            self.logic.save_config()
+        else:
+            self.var_autostart.set(is_autostart_enabled())
+            messagebox.showwarning(self.logic.tr("error"),
+                                   "Could not write the Windows autostart registry key.")
+
+    # ------------------------------ tray logic ----------------------------- #
+    def ensure_tray_icon(self):
+        """Create the pystray icon once (runs its own daemon thread)."""
+        if not TRAY_AVAILABLE or self.tray_icon is not None:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem(lambda: self.logic.tr("tray_show"),
+                             lambda icon, item: self.root.after(0, self.show_window),
+                             default=True),
+            pystray.MenuItem(lambda: self.logic.tr("tray_start"),
+                             lambda icon, item: self.root.after(0, self.tray_start),
+                             visible=lambda item: not self.logic.running),
+            pystray.MenuItem(lambda: self.logic.tr("tray_stop"),
+                             lambda icon, item: self.root.after(0, self.tray_stop),
+                             visible=lambda item: self.logic.running),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda: self.logic.tr("tray_exit"),
+                             lambda icon, item: self.root.after(0, self.exit_app)),
+        )
+        self.tray_icon = pystray.Icon(
+            APP_NAME, make_tray_image(self.logic.running),
+            self.logic.tr("title"), menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def hide_to_tray(self):
+        self.ensure_tray_icon()
+        self.root.withdraw()
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def tray_start(self):
+        """Start sorting from the tray menu while the window is hidden."""
+        if self.logic.running:
+            return
+        try:
+            self.logic.start_watch()
+        except Exception as e:
+            self.show_window()
+            messagebox.showerror(self.logic.tr("error"), str(e))
+
+    def tray_stop(self):
+        self.logic.stop_watch()
+
+    def on_close(self):
+        """Window 'X': minimize to tray (if enabled) instead of quitting."""
+        if TRAY_AVAILABLE and self.logic.config.get("minimize_to_tray", True):
+            self.hide_to_tray()
+        else:
+            self.exit_app()
+
+    def exit_app(self):
+        """Real shutdown: stop watching, remove tray icon, close Tk."""
+        self.exiting = True
+        if self.logic.running:
+            self.logic.stop_watch()
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+        self.root.destroy()
+
 
 def main():
+    start_hidden = "--hidden" in sys.argv
     root = tk.Tk()
     logic = AppLogic()
-    GUI(root, logic)
-
-    def on_closing():
-        if logic.running:
-            logic.stop_watch()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_closing)
+    GUI(root, logic, start_hidden=start_hidden)
     root.mainloop()
 
 
