@@ -339,9 +339,11 @@ def is_autostart_enabled() -> bool:
 
 _single_instance_handle = None  # keep the mutex handle alive for the whole run
 
-# Custom message used by a second (duplicate) launch to tell the first
-# instance "show your window". WM_APP + 1 is in the range reserved for apps.
-WM_SHOWME = 0x8000 + 1  # WM_APP(0x8000) + 1
+# Names of the cross-process IPC objects used for the single-instance logic:
+# a Windows event that the FIRST instance waits on, and a memory-mapped flag
+# that tells that instance whether it should also bring its window forward.
+SHOW_EVENT_NAME = f"Global\\{APP_NAME}.ShowEvent"
+FLAG_MAP_NAME = f"Global\\{APP_NAME}.ShowFlag"
 
 
 def acquire_single_instance() -> bool:
@@ -349,7 +351,8 @@ def acquire_single_instance() -> bool:
 
     Multiple running copies is the main reason users see several identical
     tray icons. If another instance already holds the mutex, we return False
-    and the caller notifies the running instance (see notify_running_instance)
+    and the caller asks the running instance to show its window
+    (see raise_show_request) before exiting without any window or icon
     before exiting without creating any window or icon.
     On non-Windows systems the check is skipped (returns True).
     """
@@ -372,19 +375,141 @@ def acquire_single_instance() -> bool:
         return True
 
 
-def notify_running_instance() -> None:
-    """Second-launch helper: broadcast WM_SHOWME so the first instance
-    un-minimizes its window instead of silently doing nothing."""
+def raise_show_request() -> None:
+    """Called by a duplicate launch: ask the running instance to show its window.
+
+    Two mechanisms are combined so it works even when the app starts hidden:
+
+    1. A tiny global shared-memory flag (pagefile-backed section). The
+       duplicate sets it to 1; the running instance reads it when the event
+       fires and only un-minimizes if somebody really asked for the window.
+       This lets autostart launches ("--hidden") stay silent while a plain
+       double-click on the .exe always brings the window back.
+    2. SetEvent on a named Windows event, which wakes up the waiting thread
+       inside the running instance immediately (no polling, no CPU cost).
+    """
     if sys.platform != "win32":
         return
     try:
         import ctypes
-        user32 = ctypes.windll.user32
-        HWND_BROADCAST = 0xFFFF
-        WM_SHOWME_MSG = WM_SHOWME
-        user32.PostMessageW(HWND_BROADCAST, WM_SHOWME_MSG, 0, 0)
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        FILE_MAP_WRITE = 0x0002
+        PAGE_READWRITE = 0x04
+
+        hmap = kernel32.OpenFileMappingW(FILE_MAP_WRITE, False, FLAG_MAP_NAME)
+        if hmap:
+            view = kernel32.MapViewOfFile(hmap, FILE_MAP_WRITE, 0, 0, 4)
+            if view:
+                ctypes.c_uint32.from_address(view).value = 1
+                kernel32.UnmapViewOfFile(view)
+            kernel32.CloseHandle(hmap)
+    except Exception:
+        pass  # best effort only
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        EVENT_MODIFY_STATE = 0x0002
+        hevt = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, SHOW_EVENT_NAME)
+        if hevt:
+            kernel32.SetEvent(hevt)
+            kernel32.CloseHandle(hevt)
     except Exception:
         pass  # cosmetic only - never crash a duplicate launcher
+
+
+class ShowEventListener(threading.Thread):
+    """First-instance side: wait on the named event and show the window.
+
+    Runs as a daemon thread with a single blocking WaitForSingleObject call,
+    so it costs zero CPU while idle. Tk calls are marshalled back onto the
+    main thread via root.after(), which is thread-safe.
+    """
+
+    def __init__(self, on_show_always: callable):
+        super().__init__(daemon=True)
+        self.on_show_always = on_show_always   # callback(bool bring_window)
+        self._stop = threading.Event()
+        self._handle = None
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                EVENT_ALL_ACCESS = 0x1F0003
+                # Create (or open) the event; keep the handle for our lifetime.
+                self._handle = kernel32.CreateEventW(None, False, False,
+                                                     SHOW_EVENT_NAME)
+            except Exception:
+                self._handle = None
+        self.start()
+
+    @staticmethod
+    def _read_and_clear_flag() -> bool:
+        """Return True (and reset) if a duplicate launch set the show flag."""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            FILE_MAP_WRITE = 0x0002
+            hmap = kernel32.OpenFileMappingW(FILE_MAP_WRITE, False, FLAG_MAP_NAME)
+            if not hmap:
+                return True
+            try:
+                view = kernel32.MapViewOfFile(hmap, FILE_MAP_WRITE, 0, 0, 4)
+                if not view:
+                    return True
+                try:
+                    cell = ctypes.c_uint32.from_address(view)
+                    value = cell.value
+                    cell.value = 0
+                    return bool(value)
+                finally:
+                    kernel32.UnmapViewOfFile(view)
+            finally:
+                kernel32.CloseHandle(hmap)
+        except Exception:
+            return True
+
+    def run(self):
+        if not self._handle:
+            return
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        WAIT_OBJECT_0 = 0
+        WAIT_TIMEOUT_MS = 500
+        while not self._stop.is_set():
+            rc = kernel32.WaitForSingleObject(ctypes.wintypes.HANDLE(self._handle),
+                                              WAIT_TIMEOUT_MS)
+            if self._stop.is_set():
+                break
+            if rc == WAIT_OBJECT_0:
+                bring = self._read_and_clear_flag()
+                try:
+                    self.on_show_always(bring)
+                except Exception:
+                    pass
+
+    def stop(self):
+        self._stop.set()
+
+
+def create_shared_flag() -> None:
+    """Create the global memory-mapped flag once at startup (first instance)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PAGE_READWRITE = 0x04
+        SEC_COMMIT = 0x08000000
+        hsec = kernel32.CreateFileMappingW(
+            ctypes.wintypes.HANDLE(-1), None, PAGE_READWRITE, 0, 4, FLAG_MAP_NAME)
+        if hsec:
+            # Keep the section handle alive for the whole process lifetime.
+            globals()["_flag_section_handle"] = hsec
+    except Exception:
+        pass
 
 
 def make_tray_image(running: bool):
@@ -1027,109 +1152,28 @@ class GUI:
         self.root.destroy()
 
 
-class ShowMeListener:
-    """Receive the WM_SHOWME broadcast from a duplicate launch and show the window.
-
-    Tkinter cannot see arbitrary Win32 messages, so we create a tiny hidden
-    message-only window with ctypes and poll it from the Tk event loop once
-    every ~200 ms (non-blocking PeekMessageW). This keeps Explorer untouched
-    and costs essentially zero CPU.
-    """
-
-    def __init__(self, on_show):
-        self.on_show = on_show
-        self.hwnd = None
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.windll.user32
-
-            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND,
-                                         wintypes.UINT, wintypes.WPARAM,
-                                         wintypes.LPARAM)
-
-            def _wnd_proc(hwnd, msg, wparam, lparam):
-                if msg == WM_SHOWME:
-                    # Hop back onto the Tk thread; never call Tk from here.
-                    on_show()
-                    return 0
-                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-            self._proc_keepalive = WNDPROC(_wnd_proc)
-
-            class WNDCLASSW(ctypes.Structure):
-                _fields_ = [("style", wintypes.UINT),
-                            ("lpfnWndProc", WNDPROC),
-                            ("cbClsExtra", ctypes.c_int),
-                            ("cbWndExtra", ctypes.c_int),
-                            ("hInstance", wintypes.HINSTANCE),
-                            ("hIcon", wintypes.HICON),
-                            ("hCursor", wintypes.HANDLE),
-                            ("hbrBackground", wintypes.HBRUSH),
-                            ("lpszMenuName", wintypes.LPCWSTR),
-                            ("lpszClassName", wintypes.LPCWSTR),
-                            ("hWndBringsToTopOnActivate", wintypes.HWND)]
-
-            HWND_MESSAGE = -3  # parent value => message-only window
-            wc = WNDCLASSW()
-            wc.lpfnWndProc = self._proc_keepalive
-            wc.hInstance = kernel32_instance = ctypes.windll.kernel32.GetModuleHandleW(None)
-            wc.lpszClassName = f"{APP_NAME}.ShowMeWindow"
-            user32.RegisterClassW(ctypes.byref(wc))
-            self.hwnd = user32.CreateWindowExW(
-                0, wc.lpszClassName, wc.lpszClassName, 0,
-                0, 0, 0, 0, wintypes.HWND(HWND_MESSAGE), 0,
-                kernel32_instance, None)
-        except Exception:
-            self.hwnd = None
-
-    def pump(self):
-        """Process pending messages for our hidden window (called via root.after)."""
-        if not self.hwnd:
-            return False
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.windll.user32
-
-            class MSG(ctypes.Structure):
-                _fields_ = [("hwnd", wintypes.HWND), ("message", wintypes.UINT),
-                            ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
-                            ("time", wintypes.DWORD), ("pt_x", wintypes.LONG),
-                            ("pt_y", wintypes.LONG)]
-
-            msg = MSG()
-            PM_REMOVE = 1
-            while user32.PeekMessageW(ctypes.byref(msg), self.hwnd, 0, 0, PM_REMOVE):
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-        except Exception:
-            pass
-        return True
-
-
 def main():
     # Guard against launching several copies (each copy adds its own tray icon).
     if not acquire_single_instance():
         # Another copy is already running: ask it to bring its window forward,
         # then exit silently (no second window, no second tray icon).
-        notify_running_instance()
+        raise_show_request()
         sys.exit(0)
     start_hidden = "--hidden" in sys.argv
     root = tk.Tk()
     logic = AppLogic()
     gui = GUI(root, logic, start_hidden=start_hidden)
 
-    # Duplicate launches broadcast WM_SHOWME -> un-minimize our window.
-    listener = ShowMeListener(lambda: root.after(0, gui.show_window))
-    def _poll_showme():
-        listener.pump()
-        root.after(200, _poll_showme)
-    root.after(200, _poll_showme)
+    # A duplicate launch signals us through a named event + shared flag.
+    # When the user simply double-clicks the .exe again, the flag is set and
+    # we un-minimize; hidden autostart launches do not touch the flag.
+    create_shared_flag()
+    listener = ShowEventListener(
+        lambda bring: root.after(0, gui.show_window) if bring else None)
 
+    root.protocol("WM_DELETE_WINDOW", gui.on_close)  # ensure clean shutdown
     root.mainloop()
+    listener.stop()
 
 
 if __name__ == "__main__":
