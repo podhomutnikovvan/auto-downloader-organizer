@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Auto Downloader Organizer - GUI version (single file, modern flat theme).
+Auto Downloader Organizer - GUI version (single file).
 
 Features
 --------
 * Watches the browser Downloads folder and moves finished files into
   category subfolders (documents, tables, presentations, images, ...).
-* Modern dark UI: custom ttk theme, card layout, status pill, colored log.
-* User-selectable UI language: English / Русский / 中文 (segmented buttons).
-  The choice is persisted in config.json; on first run it is auto-detected
-  from the system locale. Category folder names are localized too.
+* Graphical interface: start/stop button, folder pickers, live event log.
+* User-selectable UI language: English / Русский / 中文 (dropdown in the
+  window). The choice is persisted in config.json; on first run it is
+  auto-detected from the system locale.
 * System-tray mode: "minimize to tray" checkbox + "--hidden" command-line
   flag let the app start silently in the background and keep sorting even
   when the window is closed (tray icon: left-click opens the window,
   right-click menu has Show / Start / Stop / Exit).
-* Windows autostart via HKCU\\...\\Run registry key (no admin rights needed).
 * All source comments are written in English.
 
 Run:          python organizer_gui.py
@@ -27,6 +26,7 @@ Dependencies: pip install watchdog pystray pillow
 import json
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -41,6 +41,8 @@ except ImportError:
 
 # Optional tray support. If pystray/pillow are missing (or there is no
 # display yet) the app still works, but the tray options are not shown.
+# The import itself can also fail on Linux without an X server, so we catch
+# broadly here; the real backend check happens again in GUI.__init__.
 TRAY_AVAILABLE = False
 try:
     import pystray
@@ -62,40 +64,18 @@ CONFIG_FILE = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "history.log"
 
 # --------------------------------------------------------------------------- #
-# Color palette (dark "midnight" theme). One source of truth for all widgets.
-# --------------------------------------------------------------------------- #
-BG        = "#1e222d"   # window background
-CARD      = "#262b38"   # raised card surface
-FIELD     = "#191d26"   # input / log background (recessed)
-BORDER    = "#3a4152"   # hairlines, widget borders
-FG        = "#e8eaf0"   # main text
-MUTED     = "#8b93a7"   # secondary text / captions
-ACCENT    = "#4f8cff"   # brand blue (focus, links)
-GREEN     = "#2ecc71"   # running state
-GREEN_DK  = "#27ae60"
-RED       = "#e74c3c"   # stop / error
-RED_DK    = "#c0392b"
-AMBER     = "#f1c40f"   # warnings / skipped lines
-
-FONT         = "Segoe UI"           # falls back gracefully on other OSes
-FONT_MONO    = "Consolas"
-
-# --------------------------------------------------------------------------- #
 # Translations. Every user-visible string lives here so the whole interface
 # (including the generated category folder names) can be re-rendered at once.
 # --------------------------------------------------------------------------- #
 TRANSLATIONS = {
     "en": {
         "title": "Auto Downloader Organizer",
-        "subtitle": "Keeps your Downloads folder clean automatically",
-        "status_running": "RUNNING",
-        "status_paused": "PAUSED",
-        "section_folders": "FOLDERS",
-        "watch_label": "Watched folder",
-        "dest_label": "Organize into",
-        "btn_start": "\u25b6  START SORTING",
-        "btn_stop": "\u25a0  STOP",
-        "log_header": "EVENT LOG",
+        "language_label": "Language:",
+        "watch_label": "Downloads folder:",
+        "dest_label": "Organize into:",
+        "btn_start": "\u25b6 START",
+        "btn_stop": "\u25a0 STOP",
+        "log_header": "Event log:",
         "error": "Error",
         "folder_not_found": "Folder not found:\n{}",
         "started": "Sorting started: {} -> {}",
@@ -104,7 +84,6 @@ TRANSLATIONS = {
         "skipped": "Skipped (still downloading): {}",
         "error_move": "Could not move {}: {}",
         "busy": "File is busy, will retry: {}",
-        "hint": "Tip: closing the window minimizes it to the tray and keeps sorting.",
         # Tray / startup options
         "opt_tray": "Minimize to system tray (keep running when window is closed)",
         "opt_autostart": "Start automatically with Windows",
@@ -130,15 +109,12 @@ TRANSLATIONS = {
     },
     "ru": {
         "title": "Авто-сортировщик загрузок",
-        "subtitle": "Папка «Загрузки» всегда в порядке — автоматически",
-        "status_running": "РАБОТАЕТ",
-        "status_paused": "ПАУЗА",
-        "section_folders": "ПАПКИ",
-        "watch_label": "Наблюдать за папкой",
-        "dest_label": "Раскладывать в",
-        "btn_start": "\u25b6  ЗАПУСТИТЬ",
-        "btn_stop": "\u25a0  ОСТАНОВИТЬ",
-        "log_header": "ЖУРНАЛ СОБЫТИЙ",
+        "language_label": "Язык:",
+        "watch_label": "Папка загрузок:",
+        "dest_label": "Раскладывать в:",
+        "btn_start": "\u25b6 ЗАПУСТИТЬ",
+        "btn_stop": "\u25a0 ОСТАНОВИТЬ",
+        "log_header": "Журнал событий:",
         "error": "Ошибка",
         "folder_not_found": "Папка не найдена:\n{}",
         "started": "Сортировка запущена: {} -> {}",
@@ -147,7 +123,6 @@ TRANSLATIONS = {
         "skipped": "Пропуск (ещё качается): {}",
         "error_move": "Не удалось переместить {}: {}",
         "busy": "Файл занят, повторю позже: {}",
-        "hint": "Подсказка: закрытие окна сворачивает его в трей — сортировка продолжается.",
         # Tray / startup options
         "opt_tray": "Сворачивать в трей (работать при закрытом окне)",
         "opt_autostart": "Запускать автоматически вместе с Windows",
@@ -173,15 +148,12 @@ TRANSLATIONS = {
     },
     "zh": {
         "title": "下载自动整理器",
-        "subtitle": "自动保持下载文件夹整洁",
-        "status_running": "运行中",
-        "status_paused": "已暂停",
-        "section_folders": "文件夹",
-        "watch_label": "监视文件夹",
-        "dest_label": "整理到",
-        "btn_start": "\u25b6  开始整理",
-        "btn_stop": "\u25a0  停止",
-        "log_header": "事件日志",
+        "language_label": "语言：",
+        "watch_label": "下载文件夹：",
+        "dest_label": "整理到：",
+        "btn_start": "\u25b6 开始",
+        "btn_stop": "\u25a0 停止",
+        "log_header": "事件日志：",
         "error": "错误",
         "folder_not_found": "找不到文件夹：\n{}",
         "started": "整理已启动：{} -> {}",
@@ -190,7 +162,6 @@ TRANSLATIONS = {
         "skipped": "跳过（仍在下载）：{}",
         "error_move": "无法移动 {}：{}",
         "busy": "文件被占用，稍后重试：{}",
-        "hint": "提示：关闭窗口会最小化到托盘，整理继续进行。",
         # Tray / startup options
         "opt_tray": "最小化到系统托盘（关闭窗口后继续运行）",
         "opt_autostart": "随 Windows 自动启动",
@@ -287,6 +258,7 @@ def detect_system_language() -> str:
         return "zh"
     return "en"
 
+
 # --------------------------------------------------------------------------- #
 # Windows autostart helpers. The entry lives in HKCU\...\Run, so no admin
 # rights are required and it points either to the frozen .exe or to
@@ -339,13 +311,12 @@ def is_autostart_enabled() -> bool:
 
 def make_tray_image(running: bool):
     """Draw a simple 64x64 icon: green circle = sorting on, gray = paused."""
-    color = (46, 204, 113, 255) if running else (139, 147, 167, 255)
+    color = (76, 175, 80, 255) if running else (158, 158, 158, 255)
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(30, 34, 45, 255))
-    d.ellipse((12, 12, 52, 52), fill=color)
+    d.ellipse((6, 6, 58, 58), fill=color)
     # White down-arrow symbolizing "downloads sorted into folders".
-    d.polygon([(32, 44), (20, 26), (44, 26)], fill=(255, 255, 255, 255))
+    d.polygon([(32, 46), (18, 26), (46, 26)], fill=(255, 255, 255, 255))
     return img
 
 
@@ -358,8 +329,8 @@ class AppLogic:
         self.running = False
         self._handler = None  # set by start_watch(); used for retry scheduling
         # Callbacks are wired up by the GUI / tray layer.
-        self.gui_callback = lambda msg, kind="info": None  # log line -> window
-        self.state_callback = lambda: None                 # running-state changed
+        self.gui_callback = lambda msg: None   # translated log line -> window
+        self.state_callback = lambda: None     # running-state changed -> refresh UI
         self.lang = self.config.get("language") or detect_system_language()
         if self.lang not in TRANSLATIONS:
             self.lang = "en"
@@ -418,10 +389,10 @@ class AppLogic:
                 return cand
             i += 1
 
-    def log(self, message: str, kind: str = "info"):
+    def log(self, message: str):
         """Send a message to the GUI log (safe when there is no console)."""
         try:
-            self.gui_callback(message, kind)
+            self.gui_callback(message)
         except Exception:
             pass
 
@@ -436,16 +407,16 @@ class AppLogic:
         dst = self.unique_path(dst_dir / src.name)
         try:
             shutil.move(str(src), str(dst))
-            self.log(self.tr("moving", src.name, folder, dst.name), "move")
+            self.log(self.tr("moving", src.name, folder, dst.name))
             with LOG_FILE.open("a", encoding="utf-8") as f:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
         except PermissionError:
             # File is locked (browser/antivirus) - retry a bit later.
-            self.log(self.tr("busy", src.name), "warn")
+            self.log(self.tr("busy", src.name))
             if self._handler is not None:
                 self._handler.pending[src] = time.time() - self.config["settle_seconds"] + 1
         except Exception as e:
-            self.log(self.tr("error_move", src.name, e), "error")
+            self.log(self.tr("error_move", src.name, e))
 
     # ------------------------------- watching ------------------------------ #
     def start_watch(self):
@@ -467,7 +438,7 @@ class AppLogic:
                 if path.parent != watch_dir:
                     return
                 if path.suffix.lower() in PARTIAL_EXTENSIONS:
-                    logic.log(logic.tr("skipped", path.name), "warn")
+                    logic.log(logic.tr("skipped", path.name))
                     return
                 self.pending[path] = time.time()
 
@@ -514,45 +485,20 @@ class AppLogic:
         self.observer.start()
         self.running = True
         threading.Thread(target=sweep_loop, daemon=True).start()
-        self.log(self.tr("started", watch_dir, self.config["dest_dir"]), "ok")
-        self.state_callback()  # let GUI/tray refresh button + status pill
+        self.log(self.tr("started", watch_dir, self.config["dest_dir"]))
+        self.state_callback()  # let GUI/tray refresh button + icon colour
 
     def stop_watch(self):
         if self.observer:
             self.observer.stop()
             self.observer.join()
             self.running = False
-            self.log(self.tr("stopped"), "info")
+            self.log(self.tr("stopped"))
             self.state_callback()
 
 
-class Pill(tk.Canvas):
-    """Small rounded status badge: colored dot + uppercase state text."""
-
-    def __init__(self, master, **kw):
-        super().__init__(master, width=130, height=26, bg=CARD,
-                         highlightthickness=0, **kw)
-        self._text = ""
-        self._color = MUTED
-
-    def set_state(self, text: str, color: str):
-        self._text, self._color = text.upper(), color
-        self._redraw()
-
-    def _redraw(self):
-        self.delete("all")
-        w, h = int(self["width"]), int(self["height"])
-        r = h // 2
-        # Rounded background (two ellipses + rectangle).
-        self.create_oval(1, 1, 2 * r, h - 1, fill=self._color, outline="")
-        self.create_oval(w - 2 * r, 1, w - 1, h - 1, fill=self._color, outline="")
-        self.create_rectangle(r, 1, w - r, h - 1, fill=self._color, outline="")
-        self.create_text(w // 2, h // 2, text=self._text, fill="#ffffff",
-                         font=(FONT, 9, "bold"))
-
-
 class GUI:
-    """Tkinter window: language selector, folder pickers, start/stop, log, tray."""
+    """Tkinter window: language dropdown, folder pickers, start/stop, log, tray."""
 
     def __init__(self, root: tk.Tk, logic: AppLogic, start_hidden: bool = False):
         self.root = root
@@ -562,128 +508,69 @@ class GUI:
         logic.gui_callback = self.append_log
         logic.state_callback = lambda: root.after(0, self.refresh_texts)
 
+        self.var_lang = tk.StringVar(value=LANGUAGE_NAMES[logic.lang])
         self.entries = {}
-        self.buttons_lang = {}
+        self.labels = {}
 
-        self._build_theme(root)
-        root.title(logic.tr("title"))
-        root.geometry("560x520")
+        root.geometry("520x420")
         root.resizable(False, False)
-        root.configure(bg=BG)
-        try:
-            root.tk.call("tk", "scaling", 1.25)  # consistent paddings on HiDPI
-        except Exception:
-            pass
 
-        # ================= header card ================= #
-        header = tk.Frame(root, bg=CARD)
-        header.pack(fill="x", padx=16, pady=(16, 8))
-        inner = tk.Frame(header, bg=CARD)
-        inner.pack(fill="x", padx=16, pady=14)
+        # --- top row: language selector ----------------------------------- #
+        bar = tk.Frame(root)
+        bar.pack(fill="x", padx=20, pady=(12, 0))
+        self.lbl_lang = tk.Label(bar, text="")
+        self.lbl_lang.pack(side="left")
+        options = [LANGUAGE_NAMES[k] for k in ("en", "ru", "zh")]
+        self.combo_lang = ttk.Combobox(bar, values=options, state="readonly", width=12)
+        self.combo_lang.set(self.var_lang.get())
+        self.combo_lang.pack(side="right")
+        self.combo_lang.bind("<<ComboboxSelected>>", self.on_language_change)
 
-        left = tk.Frame(inner, bg=CARD)
-        left.pack(side="left", fill="x", expand=True)
-        self.lbl_title = tk.Label(left, text="", font=(FONT, 15, "bold"),
-                                  bg=CARD, fg=FG, anchor="w")
-        self.lbl_title.pack(fill="x")
-        self.lbl_subtitle = tk.Label(left, text="", font=(FONT, 9),
-                                     bg=CARD, fg=MUTED, anchor="w")
-        self.lbl_subtitle.pack(fill="x")
+        # --- folder pickers ------------------------------------------------ #
+        frame_paths = tk.Frame(root)
+        frame_paths.pack(fill="x", padx=20, pady=10)
 
-        self.pill = Pill(inner)
-        self.pill.pack(side="right", padx=(10, 0))
+        self.lbl_watch = tk.Label(frame_paths, text="")
+        self.lbl_watch.grid(row=0, column=0, sticky="w")
+        self.entry_watch = tk.Entry(frame_paths, width=38)
+        self.entry_watch.grid(row=0, column=1, padx=5)
+        self.entry_watch.insert(0, logic.config["watch_dir"])
+        tk.Button(frame_paths, text="...", width=3,
+                  command=self.browse_watch).grid(row=0, column=2)
 
-        # Language segmented buttons (under the title inside the same card).
-        lang_row = tk.Frame(header, bg=CARD)
-        lang_row.pack(fill="x", padx=16, pady=(0, 12))
-        for code in ("en", "ru", "zh"):
-            b = tk.Button(lang_row, text=LANGUAGE_NAMES[code], bd=0, relief="flat",
-                          activebackground=BORDER, cursor="hand2",
-                          font=(FONT, 9, "bold"), width=9,
-                          command=lambda c=code: self.on_language_change(c))
-            b.pack(side="left", padx=(0, 6))
-            self.buttons_lang[code] = b
+        self.lbl_dest = tk.Label(frame_paths, text="")
+        self.lbl_dest.grid(row=1, column=0, sticky="w", pady=5)
+        self.entry_dest = tk.Entry(frame_paths, width=38)
+        self.entry_dest.grid(row=1, column=1, padx=5)
+        self.entry_dest.insert(0, logic.config["dest_dir"])
+        tk.Button(frame_paths, text="...", width=3,
+                  command=self.browse_dest).grid(row=1, column=2)
 
-        # ================= folders card ================= #
-        card = tk.Frame(root, bg=CARD)
-        card.pack(fill="x", padx=16, pady=8)
-        cin = tk.Frame(card, bg=CARD)
-        cin.pack(fill="x", padx=16, pady=14)
+        # --- start / stop button ------------------------------------------ #
+        self.btn_toggle = tk.Button(root, font=("Arial", 12, "bold"),
+                                    height=2, width=22, command=self.toggle)
+        self.btn_toggle.pack(pady=12)
 
-        lbl_sec = tk.Label(cin, text="", font=(FONT, 9, "bold"),
-                           bg=CARD, fg=ACCENT, anchor="w")
-        lbl_sec.grid(row=0, column=0, columnspan=3, sticky="w")
-        self.lbl_section = lbl_sec
-
-        def add_path_row(row, label_key, initial):
-            lbl = tk.Label(cin, text="", font=(FONT, 10), bg=CARD, fg=FG,
-                           anchor="w", width=16)
-            lbl.grid(row=row + 1, column=0, sticky="w", pady=(10, 0))
-            ent = tk.Entry(cin, font=(FONT, 10), bg=FIELD, fg=FG,
-                           insertbackground=FG, relief="flat",
-                           disabledbackground="#141821", disabledforeground=MUTED)
-            ent.grid(row=row + 1, column=1, sticky="we", padx=8, pady=(10, 0), ipady=6)
-            ent.insert(0, initial)
-            btn = tk.Button(cin, text="\u22ef", width=3, bd=0, relief="flat",
-                            bg=BORDER, fg=FG, activebackground=ACCENT,
-                            activeforeground="#ffffff", cursor="hand2",
-                            font=(FONT, 10, "bold"))
-            btn.grid(row=row + 1, column=2, pady=(10, 0))
-            return lbl, ent
-
-        self.lbl_watch, self.entry_watch = add_path_row(0, "watch_label",
-                                                        logic.config["watch_dir"])
-        self.lbl_dest, self.entry_dest = add_path_row(1, "dest_label",
-                                                      logic.config["dest_dir"])
-        cin.columnconfigure(1, weight=1)
-
-        # ================= big start/stop button ================= #
-        self.btn_toggle = tk.Button(root, bd=0, relief="flat", cursor="hand2",
-                                    font=(FONT, 12, "bold"), height=2,
-                                    activeforeground="#ffffff",
-                                    command=self.toggle)
-        self.btn_toggle.pack(fill="x", padx=16, pady=(8, 4), ipady=4)
-
-        # ================= log card ================= #
-        logcard = tk.Frame(root, bg=CARD)
-        logcard.pack(fill="both", expand=True, padx=16, pady=8)
-        lin = tk.Frame(logcard, bg=CARD)
-        lin.pack(fill="both", expand=True, padx=16, pady=12)
-
-        self.lbl_log = tk.Label(lin, text="", font=(FONT, 9, "bold"),
-                                bg=CARD, fg=ACCENT, anchor="w")
-        self.lbl_log.pack(fill="x", pady=(0, 6))
-
-        lframe = tk.Frame(lin, bg=FIELD)
-        lframe.pack(fill="both", expand=True)
-        self.txt_log = tk.Text(lframe, height=8, state="disabled", bd=0,
-                               bg=FIELD, fg=FG, insertbackground=FG,
-                               font=(FONT_MONO, 9), selectbackground=ACCENT,
-                               padx=10, pady=8, wrap="word",
-                               yscrollcommand=lambda *a: None)
-        scroll = ttk.Scrollbar(lframe, command=self.txt_log.yview)
-        self.txt_log.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
+        # --- event log ----------------------------------------------------- #
+        txt_frame = tk.Frame(root)
+        txt_frame.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        self.lbl_log = tk.Label(txt_frame, anchor="w")
+        self.lbl_log.pack(fill="x")
+        self.txt_log = tk.Text(txt_frame, height=8, state="disabled",
+                               bg="#f0f0f0", font=("Consolas", 9))
+        scrollbar = tk.Scrollbar(txt_frame, command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
         self.txt_log.pack(side="left", fill="both", expand=True)
-        # Log line color tags.
-        self.txt_log.tag_configure("info",  foreground=MUTED)
-        self.txt_log.tag_configure("move",  foreground=GREEN)
-        self.txt_log.tag_configure("ok",    foreground=ACCENT)
-        self.txt_log.tag_configure("warn",  foreground=AMBER)
-        self.txt_log.tag_configure("error", foreground=RED)
 
-        # ================= options row ================= #
-        opts = tk.Frame(root, bg=BG)
-        opts.pack(fill="x", padx=20, pady=(0, 4))
+        # --- options row: tray / autostart / start-hidden ------------------ #
+        opts = tk.Frame(root)
+        opts.pack(fill="x", padx=20, pady=(0, 12))
 
         def make_check(key: str, command):
             var = tk.BooleanVar(value=bool(logic.config.get(key, False)))
-            cb = tk.Checkbutton(opts, text="", variable=var, command=command,
-                                bg=BG, fg=MUTED, selectcolor=FIELD,
-                                activebackground=BG, activeforeground=FG,
-                                font=(FONT, 9), anchor="w", bd=0,
-                                highlightthickness=0, cursor="hand2")
-            cb.pack(anchor="w", pady=1)
+            cb = tk.Checkbutton(opts, text="", variable=var, command=command)
+            cb.pack(anchor="w")
             return cb, var
 
         self.cb_tray, self.var_tray = make_check("minimize_to_tray", self.on_tray_option)
@@ -693,10 +580,6 @@ class GUI:
             self.var_autostart.set(is_autostart_enabled())  # trust the registry
         else:
             self.cb_autostart, self.var_autostart = None, None
-
-        self.lbl_hint = tk.Label(root, text="", font=(FONT, 8, "italic"),
-                                 bg=BG, fg=MUTED, anchor="w")
-        self.lbl_hint.pack(fill="x", padx=20, pady=(0, 10))
 
         # --- window close behaviour & tray icon ----------------------------- #
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -714,80 +597,34 @@ class GUI:
         elif TRAY_AVAILABLE:
             self.ensure_tray_icon()  # icon appears right away for convenience
 
-    # ------------------------------ theming -------------------------------- #
-    def _build_theme(self, root):
-        """Create the custom dark ttk theme + hover bindings helpers."""
-        style = ttk.Style(root)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("Vertical.TScrollbar", background=CARD,
-                        troughcolor=FIELD, bordercolor=FIELD, arrowcolor=MUTED,
-                        relief="flat")
-        style.map("Vertical.TScrollbar",
-                  background=[("active", BORDER)])
-
-    def _style_button(self, btn, bg_color, fg_color="#ffffff"):
-        """Apply flat colors to a tk.Button (also stores hover shades)."""
-        hover = self._shade(bg_color, 18)
-        pressed = self._shade(bg_color, -18)
-        btn.configure(bg=bg_color, fg=fg_color, activebackground=hover,
-                      disabledforeground="#ffffff")
-        btn.bind("<Enter>", lambda e: btn["state"] != "disabled" and
-                 btn.configure(bg=hover))
-        btn.bind("<Leave>", lambda e: btn.configure(bg=btn._base_bg))
-        btn.bind("<ButtonPress>", lambda e: btn.configure(bg=pressed))
-        btn.bind("<ButtonRelease>", lambda e: btn.configure(bg=btn._base_bg))
-        btn._base_bg = bg_color
-
-    @staticmethod
-    def _shade(hex_color: str, amount: int) -> str:
-        """Lighten (amount>0) or darken (amount<0) a hex color."""
-        hex_color = hex_color.lstrip("#")
-        rgb = [max(0, min(255, int(hex_color[i:i + 2], 16) + amount))
-               for i in (0, 2, 4)]
-        return "#{:02x}{:02x}{:02x}".format(*rgb)
-
     # ------------------------- language handling --------------------------- #
     def refresh_texts(self):
-        """Re-render every label according to the current language/state."""
+        """Re-render every label according to the current language."""
         tr = self.logic.tr
         self.root.title(tr("title"))
-        self.lbl_title.config(text=tr("title"))
-        self.lbl_subtitle.config(text=tr("subtitle"))
-        self.lbl_section.config(text=tr("section_folders"))
+        self.lbl_lang.config(text=tr("language_label"))
         self.lbl_watch.config(text=tr("watch_label"))
         self.lbl_dest.config(text=tr("dest_label"))
         self.lbl_log.config(text=tr("log_header"))
-        self.lbl_hint.config(text=tr("hint"))
         self.cb_tray.config(text=tr("opt_tray"))
         self.cb_hidden.config(text=tr("opt_hidden"))
         if self.cb_autostart is not None:
             self.cb_autostart.config(text=tr("opt_autostart"))
-
-        running = self.logic.running
-        # Status pill.
-        self.pill.set_state(tr("status_running") if running else tr("status_paused"),
-                            GREEN if running else MUTED)
-        # Main toggle button.
-        self._style_button(self.btn_toggle, RED_DK if running else GREEN_DK)
-        self.btn_toggle.config(text=tr("btn_stop") if running else tr("btn_start"))
-        # Language buttons: active one filled with accent, others muted.
-        for code, btn in self.buttons_lang.items():
-            if code == self.logic.lang:
-                self._style_button(btn, ACCENT)
-            else:
-                self._style_button(btn, BORDER, FG)
+        self.btn_toggle.config(
+            text=self.logic.tr("btn_stop") if self.logic.running
+            else self.logic.tr("btn_start")
+        )
         if self.tray_icon is not None:
             try:
                 self.tray_icon.title = tr("title")
-                self.tray_icon.icon = make_tray_image(running)
+                self.tray_icon.icon = make_tray_image(self.logic.running)
             except Exception:
                 pass  # tray may be mid-shutdown; ignore cosmetic failures
 
-    def on_language_change(self, code: str):
-        self.logic.set_language(code)
+    def on_language_change(self, _event=None):
+        chosen = next(k for k, v in LANGUAGE_NAMES.items()
+                      if v == self.combo_lang.get())
+        self.logic.set_language(chosen)
         self.refresh_texts()
 
     # ----------------------------- callbacks ------------------------------- #
@@ -803,13 +640,11 @@ class GUI:
             self.entry_dest.delete(0, tk.END)
             self.entry_dest.insert(0, path)
 
-    def append_log(self, message: str, kind: str = "info"):
+    def append_log(self, message: str):
         """Thread-safe log line insertion (worker threads call this)."""
-        stamp = time.strftime("%H:%M:%S")
         def _append():
             self.txt_log.configure(state="normal")
-            self.txt_log.insert(tk.END, f"[{stamp}] ", "info")
-            self.txt_log.insert(tk.END, message + "\n", kind)
+            self.txt_log.insert(tk.END, message + "\n")
             self.txt_log.see(tk.END)
             self.txt_log.configure(state="disabled")
         self.root.after(0, _append)
@@ -822,10 +657,12 @@ class GUI:
             except Exception as e:
                 messagebox.showerror(self.logic.tr("error"), str(e))
                 return
+            self.btn_toggle.config(text=self.logic.tr("btn_stop"), bg="#f44336")
             self.entry_watch.config(state="disabled")
             self.entry_dest.config(state="disabled")
         else:
             self.logic.stop_watch()
+            self.btn_toggle.config(text=self.logic.tr("btn_start"), bg="#4CAF50")
             self.entry_watch.config(state="normal")
             self.entry_dest.config(state="normal")
 

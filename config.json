@@ -1,0 +1,9 @@
+{
+    "language": "en",
+    "watch_dir": "/tmp/DL",
+    "dest_dir": "/tmp/DL_SORTED",
+    "settle_seconds": 3,
+    "minimize_to_tray": true,
+    "start_hidden": false,
+    "autostart": false
+}
