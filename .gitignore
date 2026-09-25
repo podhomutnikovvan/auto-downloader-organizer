@@ -1,6 +1,20 @@
-(empty)node_modules/
-.next/
-dist/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
 build/
+dist/
+*.spec
+
+# Runtime files (created by the app itself)
+config.json
+history.log
 *.log
-node_modules/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
