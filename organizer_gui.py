@@ -108,6 +108,7 @@ TRANSLATIONS = {
         "give_up": "Giving up on {} after too many retries; leaving it in place",
         "in_list": "Still in the browser download list, waiting: {}",
         "opened_move": "Opened from the browser, sorting now: {}",
+        "deleted_orig": "Original removed from Downloads: {}",
         "hint": "Tip: closing the window minimizes it to the tray and keeps sorting.",
         "grace_label": "Move after, sec",
         # Tray / startup options
@@ -155,6 +156,7 @@ TRANSLATIONS = {
         "give_up": "Слишком много попыток для {}; оставляю файл на месте",
         "in_list": "Файл ещё в списке загрузок браузера, жду: {}",
         "opened_move": "Открыт из браузера, сортирую: {}",
+        "deleted_orig": "Оригинал удалён из Загрузок: {}",
         "hint": "Подсказка: закрытие окна сворачивает его в трей — сортировка продолжается.",
         "grace_label": "Переносить через, сек",
         # Tray / startup options
@@ -202,6 +204,7 @@ TRANSLATIONS = {
         "give_up": "{}重试次数过多，保留原位",
         "in_list": "文件仍在浏览器下载列表中，等待：{}",
         "opened_move": "已从浏览器打开，立即整理：{}",
+        "deleted_orig": "已从下载文件夹删除原文件：{}",
         "hint": "提示：关闭窗口会最小化到托盘，整理继续进行。",
         "grace_label": "延迟移动（秒）",
         # Tray / startup options
@@ -600,6 +603,11 @@ class AppLogic:
         # the pending queue and produced photo.jpg, photo (1).jpg, ... copies
         # in the destination folder.
         self._awaiting: set[str] = set()
+        # Destination path -> fingerprint of the copy that lives there, while
+        # the locked original is still waiting in Downloads to be deleted.
+        # This map is what finally kills the endless duplication loop: a retry
+        # for such a file deletes the ORIGINAL only and never copies again.
+        self._pending_delete: dict[str, tuple] = {}  # dest key -> (mtime, size)
 
         # Callbacks are wired up by the GUI / tray layer.
         self.gui_callback = lambda msg, kind="info": None  # log line -> window
@@ -919,6 +927,20 @@ class AppLogic:
         if not src.exists() or not src.is_file():
             return
         key = self._key(src)
+        # Deletion-only pass: the organized copy already exists at its
+        # destination (see _pending_delete). Just remove the original from
+        # Downloads and NEVER copy again - this is what finally kills the
+        # endless photo.jpg / photo (1).jpg duplication loop. Checked FIRST,
+        # before any other guard, so a stale fingerprint in _seen/_moved_done
+        # can never block the pending deletion of the original.
+        with self._moving_lock:
+            delete_only = any(
+                os.path.normcase(str(Path(k).parent)) == key
+                for k in self._pending_delete
+            )
+        if delete_only:
+            self._delete_original_only(src)
+            return
         fp = self._fingerprint(src)          # BEFORE the move (src disappears after it)
         with self._moving_lock:
             if key in self._moving:
@@ -934,16 +956,9 @@ class AppLogic:
             if self._handled(key, fp):
                 return
             self._moving.add(key)
-            # A file we already moved away earlier must never be re-queued:
-            # this is the real anti-duplication guard. If a browser/antivirus
-            # re-touches an old file in Downloads (or the user re-downloads a
-            # fresh copy), that new file gets a NEW mtime and is handled
-            # normally; but a stale duplicate of an already-moved name cannot
-            # silently pile up photo.jpg / photo (1).jpg ... forever.
-            if key in self._awaiting:
-                pass  # still waiting for its grace period -> allowed to proceed
-            else:
-                self._awaiting.add(key)
+            # A freshly seen version is tracked until it is fully handled;
+            # a file still inside its grace period stays tracked as well.
+            self._awaiting.add(key)
         try:
             self._move_file_inner(src, fp)
         finally:
@@ -1013,57 +1028,44 @@ class AppLogic:
                 self._schedule_retry(src, min(max(remaining, 2.0), 5.0))
                 return
         folder = self.category_for(src.name)
+        # User request: the file must end up ONLY in the organized folder.
+        # We copy first and delete the original afterwards; on the same drive
+        # this is just as fast as a move, and it gives us a safe fallback when
+        # deleting fails (the original simply stays in Downloads until it can
+        # be removed - no data is ever lost).
+        # IMPORTANT: we also record the DESTINATION path in `_pending_delete`
+        # BEFORE the copy happens. If a duplicate event races in while this
+        # pass is still running, its own unique_path() call would otherwise
+        # pick 'photo (1).jpg' and create a second copy - but because the
+        # destination name is registered upfront, such a race resolves to the
+        # SAME path and the anti-double-copy check below skips re-copying.
         dst_dir = Path(self.config["dest_dir"]) / folder
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = self.unique_path(dst_dir / src.name)
-        # User request: the file must end up ONLY in the organized folder.
-        # If dest_dir is a subfolder of watch_dir (the default setup, e.g.
-        # Downloads\Sorted), shutil.move() would rename the whole Sorted
-        # directory into itself -> endless photo.jpg / photo (1).jpg ...
-        # duplication. So we copy first and delete the original afterwards;
-        # on the same drive this is just as fast as a move.
-        same_drive = False
+        with self._moving_lock:
+            self._pending_delete[self._key(dst)] = fp
         try:
-            same_drive = os.path.exists(dst_dir) and \
-                src.resolve().drive == dst.resolve().drive
-        except Exception:
-            pass
-        try:
-            if same_drive:
-                # Anti-double-copy: if a previous pass already copied this
-                # exact version (fingerprint recorded in _moved_done with the
-                # special "copied, original still pending deletion" marker)
-                # or the bytes are already present at dst, skip straight to
-                # deleting the original instead of creating 'file (1).jpg'.
-                prev = None
-                with self._moving_lock:
-                    prev = self._moved_done.get(key)
-                already_copied = prev is not None and prev == fp
-                if not already_copied:
-                    shutil.copy2(str(src), str(dst))  # keep timestamps/metadata
-                try:
-                    src.unlink()                   # remove from Downloads now
-                except PermissionError:
-                    # Still locked (browser preview open): remember that the
-                    # copy exists, then retry deletion shortly. The fingerprint
-                    # marker below makes the retry delete-only, never re-copy.
-                    with self._moving_lock:
-                        self._moved_done[key] = fp
-                    self._schedule_retry(src, 5.0)
-                    return
-            else:
-                shutil.move(str(src), str(dst))    # across drives: plain move
+            shutil.copy2(str(src), str(dst))     # keep timestamps/metadata
+            try:
+                src.unlink()                     # remove from Downloads now
+            except PermissionError:
+                # Still locked (browser preview open): the copy exists and is
+                # tracked in _pending_delete, so every later pass for this
+                # source path performs DELETION ONLY - never another copy.
+                self.log(self.tr("busy", src.name), "warn")
+                self._schedule_retry(src, 5.0)
+                return
         except FileNotFoundError:
             # The file vanished (user deleted/moved it) - nothing to do and,
             # crucially, NO duplicate was created.
+            with self._moving_lock:
+                self._pending_delete.pop(self._key(dst), None)
             self._finish_awaiting(src)
             self._mark_done(src, fp)
             return
-        except PermissionError:
-            self.log(self.tr("busy", src.name), "warn")
-            self._schedule_retry(src, retry_in)
-            return
         except Exception as e:
+            with self._moving_lock:
+                self._pending_delete.pop(self._key(dst), None)
             self.log(self.tr("error_move", src.name, e), "error")
             # Do not spam retries on real errors: stop tracking the file.
             self._finish_awaiting(src)
@@ -1071,16 +1073,47 @@ class AppLogic:
         # Success: clear retry counters and log the move. _mark_done() also
         # records this path as "handled for good" so no later event can make
         # us create photo (1).jpg / photo (2).jpg ... duplicates again.
-        # NOTE: in copy+delete mode with a locked original we scheduled a
-        # deletion-retry above; in that case keep tracking the source until
-        # it is really gone (the next pass hits FileNotFoundError and marks
-        # the file done automatically).
-        if not (same_drive and src.exists()):
-            self._finish_awaiting(src)     # done with this file for good
-            self._mark_done(src, fp)
+        self._finish_awaiting(src)     # done with this file for good
+        self._mark_done(src, fp)
         self.log(self.tr("moving", src.name, folder, dst.name), "move")
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
+
+    def _delete_original_only(self, src: Path):
+        """Finish a copy+delete job whose original was still locked.
+
+        The organized copy already exists at `dst` (recorded in
+        `_pending_delete`). This method ONLY tries to remove the original from
+        Downloads - it never copies anything again, so retries can never pile
+        up 'photo.jpg', 'photo (1).jpg', 'photo (2).jpg' ... in the destination
+        folder. If the original is still busy, a bounded retry is scheduled;
+        after the retry cap the file simply stays in Downloads untouched.
+        """
+        key = self._key(src)
+        with self._moving_lock:
+            entries = [(k, v) for k, v in self._pending_delete.items()
+                       if os.path.normcase(str(Path(k).parent)) == key]
+        if not entries:
+            return  # nothing pending for this exact source path
+        dest_key, _fp = entries[0]
+        try:
+            src.unlink()                    # finally remove it from Downloads
+            self._pending_delete.pop(dest_key, None)
+            self._finish_awaiting(src)      # fully handled for good
+            self._mark_done(src)
+            self.log(self.tr("deleted_orig", src.name), "move")
+        except FileNotFoundError:
+            # Original already gone (user deleted/moved it) - clean bookkeeping.
+            self._pending_delete.pop(dest_key, None)
+            self._finish_awaiting(src)
+            self._mark_done(src)
+        except PermissionError:
+            # Still locked by the browser/preview: wait and try deleting again.
+            self._schedule_retry(src, 5.0)
+        except Exception as e:
+            self.log(self.tr("error_move", src.name, e), "error")
+            self._pending_delete.pop(dest_key, None)
+            self._finish_awaiting(src)
 
     # ------------------------------- watching ------------------------------ #
     def start_watch(self):
