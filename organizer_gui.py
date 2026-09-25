@@ -639,6 +639,11 @@ class AppLogic:
             # moving it anyway (seconds). Prevents breaking "Show in folder"
             # links in the browser's own downloads list.
             "grace_seconds": 300,
+            # User request: move files OUT of Downloads but NEVER delete the
+            # original automatically - the user deletes leftovers by hand.
+            # (A plain MOVE still removes the source; this flag switches the
+            # app to copy-keep-original mode instead.)
+            "keep_original": True,
             # Tray mode: minimize-to-tray is ON by default; autostart is OFF
             # until the user ticks the checkbox (it writes to the registry).
             "minimize_to_tray": True,
@@ -787,6 +792,121 @@ class AppLogic:
                 continue  # locked / not readable - just skip this profile
         return False
 
+    @staticmethod
+    def _is_really_open(path: Path) -> bool:
+        """True if some process currently holds `path` open.
+
+        Used only by the keep-original mode to decide whether it is safe to
+        copy right now. On non-Windows platforms files are never locked this
+        way, so we always report 'not open' (= safe). Implemented with an
+        exclusive non-blocking byte lock via msvcrt; our own handle is ALWAYS
+        closed in `finally`, so this check can never make OUR process the one
+        that keeps a file busy (that was the old bug where even the user could
+        not delete the file because the organizer held it open).
+        """
+        if os.name != "nt":
+            return False
+        fh = None
+        try:
+            import msvcrt
+            fh = os.open(str(path), os.O_RDWR | os.O_BINARY)
+            try:
+                msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)   # raises OSError if busy
+            except OSError:
+                return True                              # someone has it open
+            try:
+                msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            return False
+        except OSError:
+            return True          # cannot even open -> treat as busy (safe wait)
+        except Exception:
+            return False         # unexpected error -> don't block sorting
+        finally:
+            if fh is not None:
+                try:
+                    os.close(fh)
+                except OSError:
+                    pass
+
+    def _copy_keep_original(self, src: Path, fp: tuple, grace: float,
+                            retry_in: float) -> None:
+        """Copy the file into the organized folder and LEAVE the original in
+        Downloads (user request: nothing may be deleted automatically and the
+        file must not linger inside the organizer's queues).
+
+        Rules:
+        * While the file is genuinely open by another program (browser
+          preview / player) we do NOT copy - copying would produce two
+          different versions. We just re-check every few seconds until the
+          grace period expires, then give up quietly (no duplicates ever).
+        * After the grace period we copy once no matter what; a later
+          re-download of the same name still works because duplicate copies
+          get numbered 'photo (1).jpg'.
+        * The source path is marked as handled for good BEFORE anything else,
+          so no stale event/timer can ever trigger a second copy.
+        """
+        key = self._key(src)
+        with self._moving_lock:
+            if self._moved_done.get(key) == fp:
+                return                      # already copied earlier
+            # NOTE: do NOT consult _seen here. _handled() registers every
+            # freshly seen version in _seen, so a check against it would
+            # wrongly block the very first copy of a brand-new download.
+            self._retries.pop(key, None)
+            self._timers.pop(src, None)
+            self._awaiting.discard(key)     # nothing pending - user cleans up
+        try:
+            age = time.time() - src.stat().st_mtime
+        except OSError:
+            return                          # vanished - nothing to do
+        if self._is_really_open(src):
+            remaining = grace - age
+            if remaining > 0:
+                # File is being viewed/listened to: wait outside the app,
+                # retry soon, never copy while it is open.
+                self.log(self.tr("busy", src.name), "warn")
+                self._schedule_retry(src, min(max(remaining, 2.0), 5.0))
+                return
+            # Grace expired but the file is still open: leave it untouched.
+            self.log(self.tr("give_up", src.name), "warn")
+            return
+        folder = self.category_for(src.name)
+        dst_dir = Path(self.config["dest_dir"]) / folder
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        # Anti-duplication: if the destination already holds a byte-identical
+        # copy of THIS exact file version (same mtime+size), do not create
+        # another one. unique_path() would otherwise pick 'photo (1).jpg' on
+        # every stale retry and pile up endless copies in the destination.
+        cand = dst_dir / src.name
+        try:
+            identical_copy = cand.exists() and self._fingerprint(cand) == fp
+        except Exception:
+            identical_copy = False
+        if identical_copy:
+            with self._moving_lock:
+                self._moved_done[key] = fp      # fully handled for good
+                self._seen.pop(key, None)
+            self.log(self.tr("already_copied", src.name, folder), "info")
+            return
+        dst = self.unique_path(cand)
+        try:
+            shutil.copy2(str(src), str(dst))   # original stays in Downloads
+        except FileNotFoundError:
+            return                             # user deleted it meanwhile
+        except Exception as e:
+            self.log(self.tr("error_move", src.name, e), "error")
+            return
+        # Success: one copy per version, guaranteed. Record it permanently so
+        # no later event/timer can ever copy this exact file again.
+        with self._moving_lock:
+            self._moved_done[key] = fp
+            self._seen.pop(key, None)
+        self.log(self.tr("copied_keep", src.name, folder, dst.name), "move")
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{src}\t->\t{dst}\n")
+
     def _file_opened_in_browser(self, name: str) -> bool:
         """True if the user already opened this download from the browser UI.
 
@@ -906,6 +1026,13 @@ class AppLogic:
         if not src.exists():
             return
         key = self._key(src)
+        # keep-original mode: the retry timer is the ONLY thing allowed to
+        # re-trigger processing of a file (filesystem events can never do it,
+        # which is what used to cause endless photo.jpg / photo (1).jpg ...
+        # duplication). We therefore do NOT require membership in _awaiting
+        # here; _copy_keep_original() itself guarantees exactly one copy per
+        # file version and clears all bookkeeping when done.
+        keep_mode = bool(self.config.get("keep_original", True))
         # A file that no longer has a copy at the destination cannot be
         # "delete-only" anymore; drop its stale _pending_delete entries so a
         # later re-download of the same name is processed as a fresh copy.
@@ -928,6 +1055,8 @@ class AppLogic:
             # copy+delete mode: there _moved_done[key] == fp means "the copy
             # exists at the destination, but deleting the locked original is
             # still pending" - such retries are legitimate and expected.
+            # In keep-original mode _moved_done always means "fully done"
+            # (we never delete), so any retry for the same version is blocked.
             done = self._moved_done.get(key)
             if done is not None and done != (-1.0, -1):
                 try:
@@ -936,7 +1065,21 @@ class AppLogic:
                     cur_fp = None
                 if done != cur_fp:
                     return
-            if key not in self._awaiting:
+                # A retry for the SAME version we already handled is only
+                # legitimate in copy+delete mode (the organized copy exists
+                # but deleting the locked original is still pending). In
+                # keep-original mode "done" means fully finished -> block.
+                if keep_mode:
+                    return          # copied already -> nothing left to retry
+                # copy+delete mode: _pending_delete tells us whether a delete
+                # of this exact source file is still owed; if so, allow the
+                # retry through (it will run deletion-only, never a new copy).
+                with self._moving_lock:
+                    owed = any(Path(k).name == src.name and v == cur_fp
+                               for k, v in self._pending_delete.items())
+                if not owed:
+                    return          # nothing pending -> stop scheduling
+            if key not in self._awaiting and not keep_mode:
                 return
             tries = self._retries.get(key, 0)
             if tries >= self._max_retries:
@@ -993,12 +1136,14 @@ class AppLogic:
         # always False, which silently disabled delete-only retries and made
         # every retry copy the file AGAIN as 'photo (1).jpg', 'photo (2).jpg'
         # ... while the locked original stayed in Downloads forever.
+        # In keep-original mode we NEVER delete anything ourselves, so the
+        # whole delete-only bookkeeping is skipped entirely.
         with self._moving_lock:
             try:
                 cur_fp = self._fingerprint(src)
             except Exception:
                 cur_fp = None
-            delete_only = any(
+            delete_only = (not self.config.get("keep_original", True)) and any(
                 Path(k).name == src.name and v == cur_fp
                 for k, v in self._pending_delete.items()
             )
@@ -1071,6 +1216,19 @@ class AppLogic:
                     self._moved_done.pop(old[0], None)
 
     def _move_file_inner(self, src: Path, fp=None):
+        # ---- keep-original mode (user request) ----------------------------
+        # Copy the file into the organized folder and leave the original in
+        # Downloads. Nothing is ever deleted by us, nothing stays queued in
+        # the organizer, and no endless duplication loop is possible because
+        # _copy_keep_original() marks each file version as handled exactly
+        # once. The old copy+delete machinery (_pending_delete /
+        # _delete_original_only) is bypassed entirely in this mode.
+        if self.config.get("keep_original", True):
+            grace = float(self.config.get("grace_seconds", 300))
+            retry_in = float(self.config.get("settle_seconds", 3)) + 2
+            self._copy_keep_original(src, fp or self._fingerprint(src),
+                                     grace, retry_in)
+            return
         # If this exact file version was already copied to the destination and
         # we are only waiting for Downloads' original to be unlocked, NEVER
         # copy again. Without this check every stale retry re-copied the file
