@@ -608,6 +608,13 @@ class AppLogic:
         # This map is what finally kills the endless duplication loop: a retry
         # for such a file deletes the ORIGINAL only and never copies again.
         self._pending_delete: dict[str, tuple] = {}  # dest key -> (mtime, size)
+        # THE anti-duplication guard for the copy+delete mode: while one pass
+        # is processing a source file (copying it / waiting to delete the
+        # locked original), NO second pass may touch the same path. A racing
+        # event/sweeper/retry would otherwise run unique_path() again and
+        # create photo.jpg / photo (1).jpg / photo (2).jpg ... endlessly in
+        # the destination folder - exactly the bug users reported.
+        self._processing: set[str] = set()
 
         # Callbacks are wired up by the GUI / tray layer.
         self.gui_callback = lambda msg, kind="info": None  # log line -> window
@@ -852,6 +859,11 @@ class AppLogic:
         On Windows an exclusive open() fails with a sharing violation while
         the browser still keeps the just-downloaded file locked; on Linux/macOS
         files are not locked this way, so we always report 'free'.
+
+        CRITICAL: every handle opened here MUST be closed in `finally`.
+        An earlier version skipped the close when locking failed, which made
+        OUR OWN process hold the file open forever - then neither the app nor
+        the user could delete/move it ("файл занят / используется программой").
         """
         if os.name != "nt":
             return True
@@ -859,15 +871,22 @@ class AppLogic:
             import msvcrt
             fh = os.open(str(path), os.O_RDWR | os.O_BINARY)
             try:
-                # Try to lock the first byte exclusively for 0 attempts.
-                msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)
-            except OSError:
-                return False          # someone else holds the lock
-            try:
-                msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-            return True
+                # Try to lock the first byte exclusively (non-blocking).
+                try:
+                    msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return False      # someone else holds the lock
+                try:
+                    msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+                return True
+            finally:
+                # ALWAYS release our own handle, success or failure alike.
+                try:
+                    os.close(fh)
+                except OSError:
+                    pass
         except OSError:
             return False              # cannot even open it -> treat as busy
         except Exception:
@@ -887,6 +906,15 @@ class AppLogic:
         if not src.exists():
             return
         key = self._key(src)
+        # A file that no longer has a copy at the destination cannot be
+        # "delete-only" anymore; drop its stale _pending_delete entries so a
+        # later re-download of the same name is processed as a fresh copy.
+        with self._moving_lock:
+            stale = [k for k in self._pending_delete
+                     if os.path.normcase(str(Path(k).parent)) == key
+                     and not Path(k).exists()]
+            for k in stale:
+                self._pending_delete.pop(k, None)
         with self._moving_lock:
             # A file that was already successfully moved away, or that we have
             # abandoned, must NEVER be scheduled again. This is the guard that
@@ -927,23 +955,68 @@ class AppLogic:
         if not src.exists() or not src.is_file():
             return
         key = self._key(src)
+        # THE anti-duplication guard: only ONE pass per source path at a time.
+        # While that pass runs (copying, waiting for the browser to release
+        # the original, scheduling retries), any other event/sweeper/retry for
+        # the SAME path is ignored - this is what finally kills the endless
+        # photo.jpg / photo (1).jpg / photo (2).jpg duplication loop. The set
+        # entry is removed in the `finally` block below, so after the job is
+        # done a genuine re-download of the same name still gets processed.
+        with self._moving_lock:
+            if key in self._processing:
+                return
+            # A file we are STILL tracking for deletion (its organized copy
+            # exists and _awaiting holds it) must never be re-armed by stale
+            # filesystem events. Only a brand-new job (not awaiting) or a
+            # genuine re-download (different fingerprint) may start here.
+            if key in self._awaiting and self._moved_done.get(key) == self._fingerprint(src):
+                return
+            self._processing.add(key)
+        try:
+            self._move_file_guarded(src, key)
+        finally:
+            with self._moving_lock:
+                self._processing.discard(key)
+
+    def _move_file_guarded(self, src: Path, key: str):
         # Deletion-only pass: the organized copy already exists at its
         # destination (see _pending_delete). Just remove the original from
         # Downloads and NEVER copy again - this is what finally kills the
         # endless photo.jpg / photo (1).jpg duplication loop. Checked FIRST,
         # before any other guard, so a stale fingerprint in _seen/_moved_done
         # can never block the pending deletion of the original.
+        # NOTE: keys of _pending_delete are DESTINATION paths; their PARENT is
+        # the category folder (e.g. .../Sorted/Documents), NOT the watched
+        # source folder. The reliable link back to the source is the recorded
+        # fingerprint fp (the copy preserves mtime+size via shutil.copy2) plus
+        # the file name. Comparing a dest parent against the source dir was
+        # always False, which silently disabled delete-only retries and made
+        # every retry copy the file AGAIN as 'photo (1).jpg', 'photo (2).jpg'
+        # ... while the locked original stayed in Downloads forever.
         with self._moving_lock:
+            try:
+                cur_fp = self._fingerprint(src)
+            except Exception:
+                cur_fp = None
             delete_only = any(
-                os.path.normcase(str(Path(k).parent)) == key
-                for k in self._pending_delete
+                Path(k).name == src.name and v == cur_fp
+                for k, v in self._pending_delete.items()
             )
         if delete_only:
             self._delete_original_only(src)
             return
+        # A genuine re-download of the same name is a NEW file version whose
+        # old pending-delete bookkeeping (if any copy was left over) must not
+        # shadow it; _handled() below still blocks stale events for versions
+        # we already processed.
         fp = self._fingerprint(src)          # BEFORE the move (src disappears after it)
         with self._moving_lock:
             if key in self._moving:
+                return
+            # Guard against an already-finished job: if this exact version was
+            # moved away earlier, ignore stale events instead of copying again.
+            # (Re-downloads have a different fingerprint and pass through.)
+            if self._moved_done.get(key) == fp:
                 return
             # THE anti-duplication guard: a file that was already successfully
             # moved away earlier must never be processed again. If some event
@@ -998,6 +1071,16 @@ class AppLogic:
                     self._moved_done.pop(old[0], None)
 
     def _move_file_inner(self, src: Path, fp=None):
+        # If this exact file version was already copied to the destination and
+        # we are only waiting for Downloads' original to be unlocked, NEVER
+        # copy again. Without this check every stale retry re-copied the file
+        # as 'photo (1).jpg', 'photo (2).jpg' ... endlessly.
+        if fp is not None:
+            with self._moving_lock:
+                already_copied = any(v == fp for v in self._pending_delete.values())
+            if already_copied:
+                self._delete_original_only(src)
+                return
         try:
             age = time.time() - src.stat().st_mtime
         except OSError:
@@ -1092,9 +1175,9 @@ class AppLogic:
         key = self._key(src)
         with self._moving_lock:
             entries = [(k, v) for k, v in self._pending_delete.items()
-                       if os.path.normcase(str(Path(k).parent)) == key]
+                       if Path(k).name == src.name]
         if not entries:
-            return  # nothing pending for this exact source path
+            return  # nothing pending for this exact source file
         dest_key, _fp = entries[0]
         try:
             src.unlink()                    # finally remove it from Downloads
